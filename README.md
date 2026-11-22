@@ -17,8 +17,8 @@ Blender asks once to add this page as a repository; say yes and it will also off
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
 (Preferences › System › Network).
 
-**Or without online access:** download the `.zip` from the [latest release](../../releases/latest)
-and drag the file into Blender (or use **Preferences › Get Extensions › ⌄ › Install from Disk**).
+**Or without online access:** click the link instead to download the `.zip`, then drag that file
+into Blender (or use **Preferences › Get Extensions › ⌄ › Install from Disk**).
 
 - Install the **same version on every computer**. Computers on different versions refuse to
   work together.
