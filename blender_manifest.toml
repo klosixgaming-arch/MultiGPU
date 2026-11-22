@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "multigpu"
-version = "2.5.0"
+version = "2.5.1"
 name = "MultiGPU"
 tagline = "Render an animation on every GPU of every computer you own"
 maintainer = "klosixgaming-arch"

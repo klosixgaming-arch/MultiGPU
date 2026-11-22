@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 5, 0),
+    "version": (2, 5, 1),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -107,6 +107,12 @@ _TEST = {}      # testing hooks: {"cmd": [...], "computer": id, "cpu": True, "no
 # ======================================================================================
 SHARED = r'''
 import http.client, json, math, os, re, sys, time
+
+
+def device_base(dev_id):
+    """A Cycles device id without its address: the same for one card wherever it is plugged in."""
+    d = dev_id[:-len("_OptiX")] if dev_id.endswith("_OptiX") else dev_id
+    return d.rsplit("_", 1)[0] if "_" in d else d
 
 PROTOCOL = 4
 
@@ -2205,18 +2211,32 @@ if cfg["backend"] == "CPU":
             pass
     on = ["CPU"]
 else:
+    # Cycles also remembers cards that are no longer there. Switching on one of those renders on the
+    # CPU without a word, so only a card it can see right now may be used.
+    want = cfg["device_id"]
     try:
+        import _cycles
         prefs = bpy.context.preferences.addons["cycles"].preferences
         prefs.compute_device_type = cfg["backend"]
         prefs.get_devices_for_type(cfg["backend"])
+        here = [d[2] for d in _cycles.available_devices(cfg["backend"]) if len(d) >= 3 and d[1] == cfg["backend"]]
+        if want not in here:
+            # A card gets another address when a card is added, removed or stops working: find it by name
+            same = [i for i in here if device_base(i) == device_base(want) and i not in (cfg.get("other_ids") or [])]
+            if len(same) == 1:
+                print("MultiGPU: %s is at a new address (%s, was %s)" % (cfg["label"], same[0], want), flush=True)
+                want = same[0]
+            else:
+                want = None
         for d in prefs.devices:
-            d.use = (d.id == cfg["device_id"] and d.type == cfg["backend"])
+            d.use = bool(want) and d.id == want and d.type == cfg["backend"]
             if d.use:
                 on.append(d.name)
     except Exception as e:
         leave("error", 3, error="couldn't set up %s: %s" % (cfg["backend_label"], e))
     if not on:
-        leave("error", 3, error="%s wasn't found with %s" % (cfg["label"], cfg["backend_label"]))
+        leave("error", 3, error="%s wasn't found with %s. Is the card still working? Press Find GPUs on this "
+                                "computer to look again" % (cfg["label"], cfg["backend_label"]))
     for s in bpy.data.scenes:
         try:
             s.cycles.device = "GPU"
@@ -3699,6 +3719,7 @@ def _launch(prefs, g, cid, job, blend, maps, order, addr):
     logp = os.path.join(d, "%s.%d.log" % (cid, n))
     cfg = {"addr": addr, "card": cid, "computer": _computer_id(), "label": g.name, "backend": g.backend,
            "backend_label": _LABEL.get(g.backend, g.backend), "device_id": ids.get(g.backend, ""),
+           "other_ids": [v for o in prefs.gpus if o.key != g.key for v in json.loads(o.ids or "{}").values()],
            "job": job["id"], "sync": job["sync"], "token": job["blend"].get("token"), "scene": job["scene"],
            "output": job["output"], "opts": job["opts"], "maps": maps, "ui": show, "rect": rect,
            "status": status, "log": logp, "version": VERSION, "first": job.get("first"),
@@ -4077,6 +4098,44 @@ def _backend_items(self, context):
     return items
 
 
+def _cards_stale(prefs):
+    """True when the saved list of cards no longer matches what Cycles sees (a card was added, removed,
+    moved to another slot, or stopped working). Cheap: Cycles keeps its own list."""
+    try:
+        import _cycles
+        seen = set()
+        for t in _BACKENDS:
+            for d in _cycles.available_devices(t):
+                if len(d) >= 3 and d[1] == t:
+                    seen.add(d[2])
+    except Exception:
+        return False
+    saved = set(v for g in prefs.gpus if g.key != "CPU" and not g.key.startswith("CPU-")
+                for v in json.loads(g.ids or "{}").values())
+    return seen != saved
+
+
+def refresh_cards(prefs):
+    """Look for the cards again if they changed since the list was saved. Never while this computer renders:
+    its running cards are known to the host by their place in the list."""
+    if not prefs.gpus:
+        detect_gpus(prefs)
+        return True
+    if _TEST.get("cpu") or any(not p.get("dead") for p in _A["procs"].values()):
+        return False
+    if _cards_stale(prefs):
+        before = [(g.key, g.name) for g in prefs.gpus]
+        detect_gpus(prefs)
+        after = [(g.key, g.name) for g in prefs.gpus]
+        if before and before != after:
+            gone = [n for k, n in before if k not in dict(after)]
+            new = [n for k, n in after if k not in dict(before)]
+            print("MultiGPU: the graphics cards changed. Gone or moved: %s. Found: %s"
+                  % (", ".join(gone) or "none", ", ".join(new) or "none"))
+        return True
+    return False
+
+
 def detect_gpus(prefs):
     """Fill prefs.gpus with every graphics card Cycles can see, one row per physical card, plus the CPU
     (unticked unless there's no usable graphics card, as on some ARM computers)."""
@@ -4102,6 +4161,21 @@ def detect_gpus(prefs):
     if _TEST.get("cpu"):
         found = {"CPU-%d" % i: {"name": "Test CPU %d" % (i + 1), "ids": {"CPU": "CPU"}} for i in range(_TEST["cpu"])}
     old = {g.key: (g.use, g.backend) for g in prefs.gpus}
+    try:
+        for k, v in json.loads(prefs.gpu_memory or "{}").items():   # cards that weren't there last time
+            old.setdefault(k, tuple(v))
+    except (ValueError, TypeError):
+        pass
+    # A card gets another address when a card is added, removed or stops working. It is still the same
+    # card: its tick and backend go with it.
+    spare = {}
+    for k in old:
+        if k not in found:
+            spare.setdefault(device_base(k), []).append(k)
+    for key in found:
+        if key not in old and spare.get(device_base(key)):
+            old[key] = old.pop(spare[device_base(key)].pop(0))
+    prefs.gpu_memory = json.dumps({k: list(v) for k, v in old.items() if k not in found})   # gone for now
     prefs.gpus.clear()
     names = [e["name"] for e in found.values()]
     seen = {}
@@ -4144,6 +4218,8 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
     bl_idname = __name__
     gpus: CollectionProperty(type=MULTIGPU_Device)
     hosts: CollectionProperty(type=MULTIGPU_Host)
+    gpu_memory: StringProperty(default="", options={'HIDDEN'},
+                               description="Ticks of cards that aren't connected right now")
     mode: EnumProperty(
         name="Network", default="SOLO",
         items=[("SOLO", "This Computer", "Render on this computer's cards only"),
@@ -4317,8 +4393,7 @@ def _basic_checks(context, prefs):
         return "This computer joins another one: start the render there"
     if _A.get("running_job"):
         return "Already rendering"
-    if not prefs.gpus:
-        detect_gpus(prefs)
+    refresh_cards(prefs)
     sc, rd = context.scene, context.scene.render
     if not bpy.data.filepath:
         return "Save the .blend file first"
@@ -4752,8 +4827,7 @@ class MULTIGPU_OT_join(bpy.types.Operator):
             saved.address = typed
             saved.name = r.get("name") or typed
         prefs.joined = True
-        if not prefs.gpus:
-            detect_gpus(prefs)
+        refresh_cards(prefs)
         _mark_dirty()
         self.report({'INFO'}, "Joined %s%s" % (saved.name, ". It's rendering: this computer joins in" if r.get("running") else ""))
         return {'FINISHED'}
@@ -5262,6 +5336,8 @@ def _startup():
     p = _prefs()
     if p is not None and not any(g.key == "CPU" or g.key.startswith("CPU-") for g in p.gpus):
         detect_gpus(p)                               # first run (or the first with a CPU row)
+    elif p is not None:
+        refresh_cards(p)                             # a card was added, removed or moved since last time
     return None
 
 

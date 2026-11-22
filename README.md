@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.5.0** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.5.1** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.0.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.1.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
@@ -57,6 +57,9 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   wrong is listed for you to confirm.
 - **Failures:** a failed frame goes to another card, a stuck frame is also given to an idle card,
   and a card that runs out of GPU memory restarts with tiles half the size.
+- **A card that drops out:** if a graphics card stops working, the others often get a new address
+  from the system. MultiGPU follows each card to its new address, and stops a card with a clear
+  message rather than letting Cycles quietly render its frames on the CPU.
 - **Host takeover:** if the host crashes or drops off the network mid-render, another computer
   becomes the host after about a minute. It removes the dead cards' placeholders and carries on.
   When the old host comes back, it joins as a helper by itself. Turn this off with

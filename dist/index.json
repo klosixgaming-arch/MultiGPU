@@ -7,7 +7,7 @@
       "id": "multigpu",
       "name": "MultiGPU",
       "tagline": "Render an animation on every GPU of every computer you own",
-      "version": "2.5.0",
+      "version": "2.5.1",
       "type": "add-on",
       "maintainer": "klosixgaming-arch",
       "license": [
@@ -22,9 +22,9 @@
       "tags": [
         "Render"
       ],
-      "archive_url": "./multigpu-2.5.0.zip",
-      "archive_size": 73828,
-      "archive_hash": "sha256:40b47d987b52dde2850ae004c17c28cb769ecdeac6d789c14874219cb615829c"
+      "archive_url": "./multigpu-2.5.1.zip",
+      "archive_size": 75091,
+      "archive_hash": "sha256:32cbfd2f83d8fbb3504bf56c6eff0fea639bd1d370d64521fb752f84c6bd66f1"
     }
   ]
 }
