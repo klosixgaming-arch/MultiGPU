@@ -53,6 +53,16 @@ relative to the .blend, such as `//../renders/`, is the simplest.
 - **Sync Changes:** saving the .blend (Ctrl+S) doesn't change what's rendering. **Sync Changes**
   saves the file and has each card reload it after its current frame.
 
+## Network security
+
+MultiGPU is made for a network you trust (your home or studio LAN, or a private VPN such as
+Tailscale). The connection between computers has no password or encryption.
+
+- Don't open or forward the MultiGPU port (47800 by default) to the internet.
+- Only join a host you trust: a joined computer opens the host's .blend and runs the Python
+  scripts and drivers saved in it.
+- Anyone who can reach the host's port can join it and see the job's file paths.
+
 ## Advanced options
 
 Output format (OpenEXR, OpenEXR multilayer, PNG or JPEG, each with its own settings; the default
