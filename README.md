@@ -60,10 +60,16 @@ relative to the .blend, such as `//../renders/`, is the simplest.
 - **A card that drops out:** if a graphics card stops working, the others often get a new address
   from the system. MultiGPU follows each card to its new address, and stops a card with a clear
   message rather than letting Cycles quietly render its frames on the CPU.
-- **Copy Missing Files** (on by default): a texture or linked .blend that only the host has, for
-  example on its own disk, is sent to the computers that can't find it before they render. Not
-  file sequences, and nothing over 4 GB. A file that ships with Blender is taken from each
+- **Copy Missing Files** (on by default): any file that only the host has, for example on its
+  own disk, is sent to the computers that can't find it before they render. That covers every
+  kind of file Blender knows the scene uses: textures, image sequences, tiled (UDIM) images,
+  movies, fonts, volumes, caches, IES and OSL files, linked .blend files and the files those
+  use in turn. Files with the same name from different folders are kept apart. Nothing over
+  4 GB is sent, and more than 2 GB for one computer is asked about first. Packed files travel
+  inside the .blend and need nothing. A file that ships with Blender is taken from each
   computer's own Blender.
+- **Broken links are named before the render:** a file that the host itself can't find can't be
+  sent, so the check before the render lists it by name.
 - **Host takeover:** if the host crashes or drops off the network mid-render, another computer
   becomes the host after about a minute. It removes the dead cards' placeholders and carries on.
   When the old host comes back, it joins as a helper by itself. Turn this off with

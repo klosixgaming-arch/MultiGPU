@@ -117,11 +117,75 @@ def device_base(dev_id):
 
 FILE_CHUNK = 1 << 20           # files only the host has are sent to the other computers in pieces of this size
 FILE_MAX = 4 << 30             # ... and never if they are bigger than this
+FILES_MAX = 20000              # the most files of one scene that are checked and can be sent
 
 
 def file_key(p):
     """One spelling for a path, whichever computer wrote it."""
     return (p or "").replace("\\", "/").lower()
+
+
+WALK = ('SKIP_PACKED', 'SKIP_WEAK_REFERENCES')
+WALK_ALL = WALK + ('EXPAND_SEQUENCES', 'EXPAND_TOKENS', 'EXPAND_CACHES')
+TOKENS = ("<UDIM>", "<UVTILE>")
+
+
+def path_exists(p):
+    """A file is there. For a tiled image (name.<UDIM>.png): at least one of its tiles is."""
+    if any(t in p for t in TOKENS):
+        d, name = os.path.split(p)
+        rx = re.escape(name).replace(re.escape("<UDIM>"), r"\d{4}").replace(re.escape("<UVTILE>"), r"u\d+_v\d+")
+        try:
+            return any(re.match("^" + rx + "$", n, re.I) for n in os.listdir(d))
+        except OSError:
+            return False
+    return os.path.exists(p)
+
+
+def scene_paths(bpy, expand=False, sequencer=False):
+    """Every file outside the .blend that the open scene uses, as Blender itself lists them: textures, movies,
+    linked .blend files (and the files those use), fonts, volumes, caches, IES and OSL files...
+    Returns [(kind, name, library, absolute path, one of several)]. With expand, an image sequence, a tiled
+    image or a volume sequence comes as all of its files. None when this Blender is too old to tell."""
+    walk = getattr(bpy.data, "file_path_foreach", None)
+    if walk is None or os.environ.get("MULTIGPU_OLD_FILE_LIST"):
+        return None
+    out = []
+
+    def visit(idb, path, meta):
+        kind = type(idb).__name__
+        if not path or kind in ("Sound", "Text") or (kind == "Scene" and not sequencer):
+            return None
+        if kind == "Image" and not idb.users:
+            return None
+        lib = getattr(idb, "library", None)
+        try:                                          # ".." worked out by name, the way Blender does it
+            full = os.path.normpath(bpy.path.abspath(path, library=lib))
+        except Exception:
+            full = path
+        out.append((kind, idb.name, lib.filepath if lib else "", full, bool(getattr(meta, "is_expanded", False))))
+        return None
+    try:
+        walk(visit, flags=set(WALK_ALL if expand else WALK))
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+def norm_join(base_dir, rel):
+    """base_dir with a relative path added, ".." worked out by name as Blender does. For a path of any
+    computer; the result has "/" between its parts."""
+    anchor, parts = split_any(base_dir)
+    parts = list(parts)
+    for x in (rel or "").replace("\\", "/").split("/"):
+        if x in ("", "."):
+            continue
+        if x == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(x)
+    return ("" if anchor == "/" else anchor) + "/" + "/".join(parts)
 
 
 def bundled_here(p, datafiles):
@@ -1144,9 +1208,17 @@ class Coordinator(object):
         return None
 
     def op_file(self, req, ip):
-        """A piece of a file of this render that the asking computer can't find. Only files the scene uses."""
+        """A piece of a file of this render that the asking computer can't find. Only files the scene uses.
+        With "members": the files that belong to a path (all frames of a sequence, all tiles of an image)."""
         j = self.job
-        ent = (j.get("files") or {}).get(file_key(req.get("path"))) if j and j["opts"].get("copy") else None
+        if not j or not j["opts"].get("copy"):
+            return {"error": "not a file of this render"}
+        key = file_key(req.get("path"))
+        if req.get("members"):
+            names = (j.get("sets") or {}).get(key) or ([j["files"][key]] if key in (j.get("files") or {}) else [])
+            names = [n for n in names if file_key(n) in j["files"]]
+            return {"ok": True, "members": names} if names else {"error": "not a file of this render"}
+        ent = (j.get("files") or {}).get(key)
         if not ent:
             return {"error": "not a file of this render"}
         try:
@@ -1533,8 +1605,10 @@ class Coordinator(object):
                               "opts": spec.get("opts") or {}, "frames": frames, "paths": paths, "fs": fs,
                               "existing": existing, "sync": 0, "sync_pending": False, "synced_at": None,
                               "frames_n": len(frames), "first": frames[0], "unsynced": False, "slowest": None,
-                              "files": dict((file_key(f), f) for f in (spec.get("files") or [])[:5000]
-                                            if isinstance(f, str))}
+                              "files": dict((file_key(f), f) for f in (spec.get("files") or [])[:FILES_MAX]
+                                            if isinstance(f, str)),
+                              "sets": dict((file_key(k), [f for f in v if isinstance(f, str)])
+                                           for k, v in (spec.get("sets") or {}).items() if isinstance(v, list))}
             for c in self.cards.values():
                 c.update(frame=None, frame_t=None, phase="off", stopped=False, streak=0, done=0, err=None,
                          warn=None, at=None, last_rid=None, last_fail=None, last_err=None, backup=False,
@@ -1615,6 +1689,10 @@ class Coordinator(object):
                 return {"error": "nothing is rendering"}
             j["blend"]["token"] = req.get("token")
             j["blend"]["size"] = req.get("size")
+            if isinstance(req.get("files"), list):         # the saved scene may use other files now
+                j["files"] = dict((file_key(f), f) for f in req["files"][:FILES_MAX] if isinstance(f, str))
+                j["sets"] = dict((file_key(k), [f for f in v if isinstance(f, str)])
+                                 for k, v in (req.get("sets") or {}).items() if isinstance(v, list))
             j["sync"] += 1
             j["sync_pending"] = False
             j["unsynced"] = False
@@ -2386,107 +2464,235 @@ def remap():
     return n
 
 
-def host_forms(p):
-    """The ways the host may know a path that this computer sees as p."""
-    out = [p]
-    for hp, lp in MAPS:
-        q = map_path(p, [[lp, hp]])
+LIBMAPS = []    # [the host's folder, this computer's folder] of copied files: files next to them are found too
+
+
+def host_forms(p, raw=None, lib=None):
+    """The ways the host may know a path that this computer sees as p (raw: as the scene has it; lib: the
+    library it comes from)."""
+    out = []
+
+    def to_host(q):
+        for maps in ([[lp, hp] for hp, lp in LIBMAPS], [[lp, hp] for hp, lp in MAPS]):
+            r = map_path(q, maps)
+            if r != q:
+                return r
+        return q
+    if raw and raw.startswith("//"):
+        # A path relative to a file: the host worked it out from where ITS copy of that file is, which can lead
+        # somewhere else entirely than from this computer's copy.
+        try:
+            base = bpy.data.filepath if lib is None else os.path.normpath(bpy.path.abspath(lib.filepath))
+            out.append(norm_join(strip_tail(to_host(base), 1), raw[2:]))
+        except Exception:
+            pass
+    for q in (to_host(p), p):
         if q not in out:
             out.append(q)
     return out
 
 
-def fetch(p, store):
-    """Get a file only the host has. Returns where it is kept on this computer, or None."""
-    for hp in host_forms(p):
+def cache_dir(host_dir):
+    """Where this computer keeps the files it was sent from one folder of the host. Files of one folder stay
+    together (frames of a sequence, tiles of an image), and the folder is remembered so that a copied .blend
+    library finds the files it uses by a path relative to itself."""
+    d = os.path.join(STORE, hashlib.sha1(file_key(host_dir).encode("utf-8")).hexdigest()[:12], "_", "_", "_", "_")
+    if not any(lp == d for _hp, lp in LIBMAPS):
+        for k in range(5):
+            hp, lp = strip_tail(host_dir, k), strip_tail(d, k)
+            if not hp or not split_any(hp)[1]:
+                break
+            LIBMAPS.append([hp, lp])
+    return d
+
+
+def local_name(hp):
+    name = (split_any(hp)[1] or ["file"])[-1]
+    if os.name == "nt":
+        name = re.sub(r'[:*?"|]', "_", name)
+    return name
+
+
+def fetch_one(hp):
+    """Get one file from the host. Returns where it is kept on this computer, or None."""
+    try:
+        r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
+    except OSError:
+        return None
+    if not r.get("ok"):
+        log("the host didn't send %s: %s" % (local_name(hp), r.get("error")))
+        return None
+    size, mtime = int(r["size"]), float(r["mtime"])
+    name = local_name(hp)
+    d = cache_dir(strip_tail(hp, 1))
+    dst, lock, tmp = os.path.join(d, name), os.path.join(d, name + ".lock"), os.path.join(d, "%s.%d.part" % (name, os.getpid()))
+
+    def good():
+        return os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 2
+    mine = False
+    try:
+        os.makedirs(d, exist_ok=True)
+        while not good():                             # one card at a time gets a file; the others wait for it
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                mine = True
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(lock) > 90:
+                        os.remove(lock)
+                        continue
+                except OSError:
+                    continue
+                time.sleep(0.5)
+        if good():
+            os.utime(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(d)))), None)   # still in use
+            return dst
+        if size > FILE_MAX or shutil.disk_usage(d).free < size + (2 << 30):
+            log("not copying %s from the host: no room for it in this computer's temporary folder" % name)
+            return None
+        got = 0
+        with open(tmp, "wb") as f:
+            while got < size:
+                r = rpc(host_addr(), {"op": "file", "path": hp, "off": got, "n": FILE_CHUNK}, timeout=60)
+                data = base64.b64decode(r.get("data") or "") if r.get("ok") else b""
+                if not data or int(r.get("size", -1)) != size:
+                    raise OSError(r.get("error") or "the file changed or the copy stopped")
+                f.write(data)
+                got += len(data)
+                os.utime(lock, None)
+        os.utime(tmp, (mtime, mtime))
+        os.replace(tmp, dst)
+        COPIED[0] += 1
+        COPIED[1] += size
+        return dst
+    except (OSError, ValueError) as e:
+        log("couldn't copy %s from the host: %s" % (name, e))
+        return None
+    finally:
+        for q in ([lock] if mine else []) + [tmp]:
+            try:
+                os.remove(q)
+            except OSError:
+                pass
+
+
+def fetch(p, raw=None, lib=None):
+    """Get a file only the host has, with the files that belong to it (the frames of a sequence, the tiles of
+    an image). Returns the path to use on this computer, or None."""
+    for hp in host_forms(p, raw, lib):
         try:
-            r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
+            r = rpc(host_addr(), {"op": "file", "path": hp, "members": True}, timeout=15)
         except OSError:
             return None
         if not r.get("ok"):
             continue
-        size, mtime = int(r["size"]), float(r["mtime"])
-        name = re.sub(r"[^A-Za-z0-9._ -]", "_", (split_any(hp)[1] or ["file"])[-1])[-120:] or "file"
-        d = os.path.join(store, hashlib.sha1(file_key(hp).encode("utf-8")).hexdigest()[:12])
-        dst = os.path.join(d, name)
-        try:
-            os.makedirs(d, exist_ok=True)
-            if os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 2:
-                os.utime(d, None)                        # still in use: keep it
-                return dst
-            if size > FILE_MAX or shutil.disk_usage(d).free < size + (2 << 30):
-                log("not copying %s from the host: it is too big for this computer's temporary folder" % name)
-                return None
-            log("copying %s from the host (%.1f MB)" % (name, size / 1048576.0))
-            tmp = "%s.%d.part" % (dst, os.getpid())
-            got = 0
-            with open(tmp, "wb") as f:
-                while got < size:
-                    r = rpc(host_addr(), {"op": "file", "path": hp, "off": got, "n": FILE_CHUNK}, timeout=60)
-                    data = base64.b64decode(r.get("data") or "") if r.get("ok") else b""
-                    if not data or int(r.get("size", -1)) != size:
-                        raise OSError(r.get("error") or "the file changed or the copy stopped")
-                    f.write(data)
-                    got += len(data)
-            os.utime(tmp, (mtime, mtime))
-            os.replace(tmp, dst)
-            return dst
-        except (OSError, ValueError) as e:
-            log("couldn't copy %s from the host: %s" % (name, e))
-            try:
-                os.remove(tmp)
-            except (OSError, NameError):
-                pass
+        got = [fetch_one(m) for m in r["members"]]
+        if not any(got):
+            log("couldn't copy %s from the host" % local_name(hp))
             return None
+        if not all(got):
+            log("%d of the %d files of %s couldn't be copied" % (len(got) - len([g for g in got if g]), len(got), local_name(hp)))
+        return os.path.join(cache_dir(strip_tail(hp, 1)), local_name(hp))
     return None
+
+
+STORE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(cfg["status"])))), "files")
+COPIED = [0, 0]
 
 
 def find_missing():
     """Files this computer can't open: copy them from the host (if the host allows it), or use the one that
-    ships with this computer's Blender. Returns (copied, taken from Blender)."""
-    store = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(cfg["status"])))), "files")
+    ships with this computer's Blender. Every kind of file Blender knows the scene uses, and again after a
+    copied library has been loaded, for the files that library uses. Returns (copied, taken from Blender)."""
+    walk = None if os.environ.get("MULTIGPU_OLD_FILE_LIST") else getattr(bpy.data, "file_path_foreach", None)
     try:                                              # copies nothing has used for a month
-        for n in os.listdir(store):
-            q = os.path.join(store, n)
+        for n in os.listdir(STORE):
+            q = os.path.join(STORE, n)
             if time.time() - os.path.getmtime(q) > 30 * 86400:
                 shutil.rmtree(q, ignore_errors=True)
     except OSError:
         pass
-    ncopy = nown = 0
-    done = {}
-    for coll in ("images", "libraries", "cache_files", "volumes"):
-        for idb in list(getattr(bpy.data, coll, [])):
-            fp = getattr(idb, "filepath", "") or ""
-            if not fp or getattr(idb, "packed_file", None):
-                continue
-            if coll == "images" and (idb.source not in ("FILE", "MOVIE") or idb.users == 0):
-                continue
-            p = bpy.path.abspath(fp, library=getattr(idb, "library", None))
-            if os.path.exists(p):
-                continue
-            if p not in done:
-                new = None
-                if OPTS.get("copy") and not getattr(idb, "is_sequence", False):
-                    new = fetch(p, store)
-                    ncopy += bool(new)
-                if not new:
-                    new = bundled_here(p, _df)
-                    nown += bool(new)
-                done[p] = new
-            if done[p]:
+    tried, count = {}, [0, 0]
+
+    def better(p, raw=None, lib=None):
+        """A path that works on this computer for p, or None."""
+        if p not in tried:
+            new = fetch(p, raw, lib) if OPTS.get("copy") else None
+            if new:
+                count[0] += 1
+            else:
+                new = bundled_here(p, _df)
+                count[1] += bool(new)
+            tried[p] = new
+        return tried[p]
+
+    for _round in range(8):
+        changed = []
+        if walk is not None:
+            def visit(idb, path, meta):
+                kind = type(idb).__name__
+                if not path or kind in ("Sound", "Text") or getattr(meta, "is_readonly", False):
+                    return None
+                if (kind == "Scene" and not OPTS.get("sequencer")) or (kind == "Image" and not idb.users):
+                    return None
+                lib = getattr(idb, "library", None)
+                p = os.path.normpath(bpy.path.abspath(path, library=lib))
+                if path_exists(p) or os.path.isdir(p):
+                    return None
+                new = better(p, path, lib)
+                if new:
+                    changed.append((kind, idb.name, lib.filepath if lib else None))
+                    if os.environ.get("MULTIGPU_DEBUG"):
+                        log("round %d: %s %s: %s -> %s" % (_round, kind, idb.name, p, new))
+                return new
+            walk(visit, flags=set(WALK))
+        else:                                         # an older Blender: the kinds of file that matter most
+            for coll in ("images", "libraries", "cache_files", "volumes"):
+                for idb in list(getattr(bpy.data, coll, [])):
+                    fp = getattr(idb, "filepath", "") or ""
+                    if not fp or getattr(idb, "packed_file", None):
+                        continue
+                    if coll == "images" and (idb.source not in ("FILE", "MOVIE") or idb.users == 0):
+                        continue
+                    lib = getattr(idb, "library", None)
+                    p = os.path.normpath(bpy.path.abspath(fp, library=lib))
+                    if os.path.exists(p):
+                        continue
+                    new = better(p, fp, lib)
+                    if new:
+                        idb.filepath = new
+                        changed.append((type(idb).__name__, idb.name, lib.filepath if lib else None))
+        if not changed:
+            break
+        # a library that was just found brings its own files: load it, then look again
+        for kind, name, lib in changed:
+            if kind == "Library":
                 try:
-                    idb.filepath = done[p]
-                    if coll in ("libraries", "images"):
-                        idb.reload()
+                    bpy.data.libraries[name].reload()
                 except Exception as e:
-                    log("couldn't switch to %s: %s" % (done[p], e))
-    return ncopy, nown
+                    log("couldn't load the copied %s: %s" % (name, e))
+        for kind, name, lib in changed:
+            if kind == "Image":
+                try:
+                    img = bpy.data.images.get((name, lib))
+                    if img is not None:
+                        img.reload()
+                except Exception:
+                    pass
+    if COPIED[0]:
+        log("copied %d file%s from the host (%.1f MB)" % (COPIED[0], "" if COPIED[0] == 1 else "s", COPIED[1] / 1048576.0))
+    return count[0], count[1]
 
 
 def missing_files():
     """Files this computer can't open although the host can."""
     host = set(OPTS.get("host_missing") or [])
     miss = []
+    rows = scene_paths(bpy, sequencer=bool(OPTS.get("sequencer")))
+    if rows is not None:
+        miss = [os.path.basename(p) for _k, _n, _l, p, _e in rows if not path_exists(p) and not os.path.isdir(p)]
+        return sorted(set(m for m in miss if m.lower() not in host))
     for img in bpy.data.images:
         if img.packed_file or img.source not in ("FILE", "MOVIE") or not img.filepath or img.users == 0:
             continue
@@ -4100,8 +4306,16 @@ def _sync_tick():
     if err is None:
         _A["sync"] = None
         try:
-            rpc(s["addr"], {"op": "sync_end", "token": s["token"], "size": os.path.getsize(bpy.data.filepath),
-                            "computer": _computer_id()})
+            more = {}
+            p = _prefs()
+            if p is not None and p.copy_missing:
+                try:
+                    sets = {}
+                    more = {"files": sorted(_sendable(_external_files(sets)[0])), "sets": sets}
+                except Exception:
+                    traceback.print_exc()
+            rpc(s["addr"], dict({"op": "sync_end", "token": s["token"], "size": os.path.getsize(bpy.data.filepath),
+                                 "computer": _computer_id()}, **more))
             _A["msg"] = "Changes saved. Each card picks them up after its current frame"
         except OSError as e:
             _A["msg"] = "Saved, but couldn't tell the host: %s" % e
@@ -4422,9 +4636,10 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
                     "taken. Frames are handed out by the host either way, so none is ever rendered twice")
     copy_missing: BoolProperty(
         name="Copy Missing Files", default=True,
-        description="When another computer can't find a file this scene uses (a texture, a linked .blend ...), "
-                    "send it there from this computer before that computer renders. The copy is kept in its "
-                    "temporary folder. Files over 4 GB and file sequences are never sent")
+        description="When another computer can't find a file this scene uses (a texture, an image sequence, a "
+                    "linked .blend and the files it uses, a font, a volume ...), send it there from this "
+                    "computer before that computer renders. The copy is kept in its temporary folder. "
+                    "Files over 4 GB are never sent, and more than 2 GB for one computer is asked about first")
     overwrite: BoolProperty(
         name="Overwrite", default=False,
         description="Render frames that already exist again. Off: they're skipped, so Render carries on where "
@@ -4505,13 +4720,45 @@ def _job_frames(sc):
     return frames, paths
 
 
-def _external_files():
-    """(files outside the .blend that this computer can open, names of the ones it can't)."""
+def _external_files(sets=None):
+    """(files outside the .blend that this computer can open, names of the ones it can't). Everything Blender
+    knows the scene uses, each frame of a sequence and each tile of a tiled image on its own.
+    sets, if given, is filled with {path as the scene has it: [the files that belong to it]}."""
+    sc = bpy.context.scene
+    seqr = bool(sc and sc.render.use_sequencer and _sequencer_strips(sc))
+    rows = scene_paths(bpy, expand=True, sequencer=seqr)
+    if rows is None:
+        return _external_files_old()
+    have, missing, seen = [], set(), set()
+    groups = {}
+    for kind, name, lib, p, one_of in rows:
+        if one_of:
+            groups.setdefault((kind, name, lib), []).append(p)
+        k = file_key(p)
+        if k in seen or os.path.isdir(p):
+            continue
+        seen.add(k)
+        if any(t in p for t in TOKENS):               # a tiled image that couldn't be listed tile by tile
+            if not path_exists(p):
+                missing.add(os.path.basename(p))
+        elif os.path.isfile(p):
+            have.append(p)
+        else:
+            missing.add(os.path.basename(p) or p)
+    if sets is not None and groups:
+        for kind, name, lib, p, _one in scene_paths(bpy, sequencer=seqr) or []:
+            if (kind, name, lib) in groups:
+                sets[p] = groups[(kind, name, lib)]
+    return sorted(have), sorted(missing)
+
+
+def _external_files_old():
+    """The same for a Blender too old to list them itself: textures, movies, libraries, caches, volumes."""
     have, missing = set(), set()
 
     def add(fp, lib):
         try:
-            p = bpy.path.abspath(fp, library=lib)
+            p = os.path.normpath(bpy.path.abspath(fp, library=lib))
         except Exception:
             return
         (have if os.path.exists(p) else missing).add(p)
@@ -4528,24 +4775,19 @@ def _external_files():
 
 def _sendable(files):
     """Of the files this scene uses, the ones that may be sent to a computer that can't find them:
-    {path: size}. Not file sequences (only their first file is known here) and nothing over 4 GB."""
-    seq = set()
-    for coll in ("cache_files", "volumes"):
-        for idb in getattr(bpy.data, coll, []):
-            if getattr(idb, "is_sequence", False) and idb.filepath:
-                try:
-                    seq.add(bpy.path.abspath(idb.filepath, library=getattr(idb, "library", None)))
-                except Exception:
-                    pass
+    {path: size}. Nothing over 4 GB."""
     out = {}
     for f in files:
         try:
             n = os.path.getsize(f)
         except OSError:
             continue
-        if f not in seq and os.path.isfile(f) and n <= FILE_MAX:
+        if os.path.isfile(f) and n <= FILE_MAX:
             out[f] = n
     return out
+
+
+COPY_ASK = 2 << 30             # sending more than this to one computer is asked about first
 
 
 def _size_text(n):
@@ -4666,8 +4908,8 @@ def _precheck(context, prefs):
             f.write("x")
         rpc(addr, {"op": "precheck", "pre": {
             "id": pid, "host": me, "blend": {"path": bpy.data.filepath, "size": os.path.getsize(bpy.data.filepath)},
-            "files": files[:500], "outdir": outdir, "probe": probe, "needs": _needs(), "datafiles": _datafiles(),
-            "copy": _sendable(files[:500]) if prefs.copy_missing else None}},
+            "files": files[:FILES_MAX], "outdir": outdir, "probe": probe, "needs": _needs(),
+            "datafiles": _datafiles(), "copy": _sendable(files[:FILES_MAX]) if prefs.copy_missing else None}},
             timeout=4)
         t0 = time.time()
         while time.time() - t0 < _TEST.get("pre_wait", 14):     # the other computers answer within a few seconds
@@ -4703,8 +4945,10 @@ def _precheck(context, prefs):
                               % (name, ", ".join(r["needs"]))))
             if r.get("copy"):
                 n, size, names = r["copy"]
-                lines.append(('IMPORT', "%s gets %d file%s from this computer first (%s):"
-                              % (name, n, "" if n == 1 else "s", _size_text(size))))
+                big = size > COPY_ASK
+                lines.append(('INFO' if big else 'IMPORT', "%s gets %d file%s from this computer first (%s%s):"
+                              % (name, n, "" if n == 1 else "s", _size_text(size),
+                                 ", this will take a while" if big else "")))
                 lines += _names(names, total=n)
             if r.get("nmissing"):
                 n = r["nmissing"]
@@ -4807,7 +5051,8 @@ class MULTIGPU_OT_render(bpy.types.Operator):
                 self.report({'ERROR'}, "Couldn't save the file: %s" % err)
                 return {'CANCELLED'}
         frames, paths = _job_frames(sc)
-        files, host_missing = _external_files()
+        sets = {}
+        files, host_missing = _external_files(sets)
         spec = {"host": _computer_id(), "host_name": _computer_name(), "scene": sc.name, "output": rd.filepath,
                 "frames": frames, "paths": paths,
                 "blend": {"path": bpy.data.filepath, "name": bpy.path.basename(bpy.data.filepath),
@@ -4820,6 +5065,7 @@ class MULTIGPU_OT_render(bpy.types.Operator):
                          "datafiles": _datafiles(), "copy": bool(prefs.copy_missing)}}
         if prefs.copy_missing:
             spec["files"] = sorted(_sendable(files))
+            spec["sets"] = sets
         try:
             r = rpc(addr, {"op": "start", "job": spec}, timeout=120)
         except OSError as e:
