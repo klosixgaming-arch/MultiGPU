@@ -114,6 +114,25 @@ def device_base(dev_id):
     d = dev_id[:-len("_OptiX")] if dev_id.endswith("_OptiX") else dev_id
     return d.rsplit("_", 1)[0] if "_" in d else d
 
+
+FILE_CHUNK = 1 << 20           # files only the host has are sent to the other computers in pieces of this size
+FILE_MAX = 4 << 30             # ... and never if they are bigger than this
+
+
+def file_key(p):
+    """One spelling for a path, whichever computer wrote it."""
+    return (p or "").replace("\\", "/").lower()
+
+
+def bundled_here(p, datafiles):
+    """A file that ships with Blender (.../datafiles/...), in this computer's own Blender. None if it has none."""
+    s = (p or "").replace("\\", "/")
+    i = s.lower().rfind("/datafiles/")
+    if i < 0 or not datafiles:
+        return None
+    q = os.path.join(datafiles, *[x for x in s[i + len("/datafiles/"):].split("/") if x])
+    return q if os.path.isfile(q) else None
+
 PROTOCOL = 4
 
 
@@ -1124,6 +1143,24 @@ class Coordinator(object):
                     "every computer." % (self.version, name or "the other computer", addon))
         return None
 
+    def op_file(self, req, ip):
+        """A piece of a file of this render that the asking computer can't find. Only files the scene uses."""
+        j = self.job
+        ent = (j.get("files") or {}).get(file_key(req.get("path"))) if j and j["opts"].get("copy") else None
+        if not ent:
+            return {"error": "not a file of this render"}
+        try:
+            off, n = max(0, int(req.get("off") or 0)), max(0, min(int(req.get("n") or 0), FILE_CHUNK))
+            st = os.stat(ent)
+            data = b""
+            if n:
+                with open(ent, "rb") as f:
+                    f.seek(off)
+                    data = f.read(n)
+        except (OSError, ValueError, TypeError) as e:
+            return {"error": "the host can't read it (%s)" % (getattr(e, "strerror", None) or e)}
+        return {"ok": True, "size": st.st_size, "mtime": st.st_mtime, "data": base64.b64encode(data).decode("ascii")}
+
     def op_ping(self, req, ip):
         with self.lock:
             name = next((c.get("name") for c in self.computers.values() if c.get("host")), None)
@@ -1495,7 +1532,9 @@ class Coordinator(object):
                               "scene": spec.get("scene"), "output": spec.get("output"), "outdir": outdir,
                               "opts": spec.get("opts") or {}, "frames": frames, "paths": paths, "fs": fs,
                               "existing": existing, "sync": 0, "sync_pending": False, "synced_at": None,
-                              "frames_n": len(frames), "first": frames[0], "unsynced": False, "slowest": None}
+                              "frames_n": len(frames), "first": frames[0], "unsynced": False, "slowest": None,
+                              "files": dict((file_key(f), f) for f in (spec.get("files") or [])[:5000]
+                                            if isinstance(f, str))}
             for c in self.cards.values():
                 c.update(frame=None, frame_t=None, phase="off", stopped=False, streak=0, done=0, err=None,
                          warn=None, at=None, last_rid=None, last_fail=None, last_err=None, backup=False,
@@ -2019,7 +2058,7 @@ main()
 # The script each card's Blender runs: asks the host for a frame, renders it, repeats.
 # ======================================================================================
 WORKER = r'''
-import atexit, shutil, threading, traceback
+import atexit, base64, hashlib, shutil, threading, traceback
 import bpy
 
 cfg = json.load(open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8"))
@@ -2282,6 +2321,7 @@ def smaller_tile():
 
 
 # ---- paths from the host's computer -> this computer -------------------------------------
+_df = None
 try:                                        # files that ship with Blender live in each computer's own install
     _df = bpy.utils.system_resource('DATAFILES')
     if OPTS.get("datafiles") and _df and split_any(_df) != split_any(OPTS["datafiles"]):
@@ -2346,6 +2386,103 @@ def remap():
     return n
 
 
+def host_forms(p):
+    """The ways the host may know a path that this computer sees as p."""
+    out = [p]
+    for hp, lp in MAPS:
+        q = map_path(p, [[lp, hp]])
+        if q not in out:
+            out.append(q)
+    return out
+
+
+def fetch(p, store):
+    """Get a file only the host has. Returns where it is kept on this computer, or None."""
+    for hp in host_forms(p):
+        try:
+            r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
+        except OSError:
+            return None
+        if not r.get("ok"):
+            continue
+        size, mtime = int(r["size"]), float(r["mtime"])
+        name = re.sub(r"[^A-Za-z0-9._ -]", "_", (split_any(hp)[1] or ["file"])[-1])[-120:] or "file"
+        d = os.path.join(store, hashlib.sha1(file_key(hp).encode("utf-8")).hexdigest()[:12])
+        dst = os.path.join(d, name)
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 2:
+                os.utime(d, None)                        # still in use: keep it
+                return dst
+            if size > FILE_MAX or shutil.disk_usage(d).free < size + (2 << 30):
+                log("not copying %s from the host: it is too big for this computer's temporary folder" % name)
+                return None
+            log("copying %s from the host (%.1f MB)" % (name, size / 1048576.0))
+            tmp = "%s.%d.part" % (dst, os.getpid())
+            got = 0
+            with open(tmp, "wb") as f:
+                while got < size:
+                    r = rpc(host_addr(), {"op": "file", "path": hp, "off": got, "n": FILE_CHUNK}, timeout=60)
+                    data = base64.b64decode(r.get("data") or "") if r.get("ok") else b""
+                    if not data or int(r.get("size", -1)) != size:
+                        raise OSError(r.get("error") or "the file changed or the copy stopped")
+                    f.write(data)
+                    got += len(data)
+            os.utime(tmp, (mtime, mtime))
+            os.replace(tmp, dst)
+            return dst
+        except (OSError, ValueError) as e:
+            log("couldn't copy %s from the host: %s" % (name, e))
+            try:
+                os.remove(tmp)
+            except (OSError, NameError):
+                pass
+            return None
+    return None
+
+
+def find_missing():
+    """Files this computer can't open: copy them from the host (if the host allows it), or use the one that
+    ships with this computer's Blender. Returns (copied, taken from Blender)."""
+    store = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(cfg["status"])))), "files")
+    try:                                              # copies nothing has used for a month
+        for n in os.listdir(store):
+            q = os.path.join(store, n)
+            if time.time() - os.path.getmtime(q) > 30 * 86400:
+                shutil.rmtree(q, ignore_errors=True)
+    except OSError:
+        pass
+    ncopy = nown = 0
+    done = {}
+    for coll in ("images", "libraries", "cache_files", "volumes"):
+        for idb in list(getattr(bpy.data, coll, [])):
+            fp = getattr(idb, "filepath", "") or ""
+            if not fp or getattr(idb, "packed_file", None):
+                continue
+            if coll == "images" and (idb.source not in ("FILE", "MOVIE") or idb.users == 0):
+                continue
+            p = bpy.path.abspath(fp, library=getattr(idb, "library", None))
+            if os.path.exists(p):
+                continue
+            if p not in done:
+                new = None
+                if OPTS.get("copy") and not getattr(idb, "is_sequence", False):
+                    new = fetch(p, store)
+                    ncopy += bool(new)
+                if not new:
+                    new = bundled_here(p, _df)
+                    nown += bool(new)
+                done[p] = new
+            if done[p]:
+                try:
+                    idb.filepath = done[p]
+                    if coll in ("libraries", "images"):
+                        idb.reload()
+                except Exception as e:
+                    log("couldn't switch to %s: %s" % (done[p], e))
+    return ncopy, nown
+
+
 def missing_files():
     """Files this computer can't open although the host can."""
     host = set(OPTS.get("host_missing") or [])
@@ -2390,6 +2527,11 @@ def check_needs():
 
 
 nmap = remap()
+try:
+    ncopy, nown = find_missing()
+except Exception:
+    ncopy = nown = 0
+    log("looking for missing files failed:\n" + traceback.format_exc())
 OUT = cfg["output"]
 if not OUT.startswith("//"):
     OUT = map_path(OUT, MAPS)
@@ -2398,8 +2540,9 @@ miss = missing_files()
 warn = ("can't find %d file%s the host has: %s" % (len(miss), "" if len(miss) == 1 else "s", ", ".join(miss[:3]) + (" ..." if len(miss) > 3 else ""))) if miss else None
 if TILE:
     warn = "; ".join(x for x in (warn, "rendering in %d px tiles after running out of GPU memory" % TILE) if x)
-log("%s with %s, persistent data %s, output %s%s%s" % (on[0], cfg["backend_label"], "on" if rd.use_persistent_data else "off",
-    OUT, ", %d path%s converted" % (nmap, "" if nmap == 1 else "s") if nmap else "", ", " + warn if warn else ""))
+log("%s with %s, persistent data %s, output %s%s%s%s" % (on[0], cfg["backend_label"], "on" if rd.use_persistent_data else "off",
+    OUT, ", %d path%s converted" % (nmap, "" if nmap == 1 else "s") if nmap else "",
+    ", %d file%s copied from the host" % (ncopy, "" if ncopy == 1 else "s") if ncopy else "", ", " + warn if warn else ""))
 
 
 # ---- rendering one frame -------------------------------------------------------------
@@ -3623,6 +3766,21 @@ def _pre_thread(pre, extra, datafiles, addons):
         if pre.get("datafiles") and datafiles and split_any(datafiles) != split_any(pre["datafiles"]):
             maps.append([pre["datafiles"], datafiles])
         miss = [f for f in pre.get("files") or [] if not os.path.exists(map_path(f, maps))]
+        sizes = pre.get("copy") or {}
+        sent = [f for f in miss if f in sizes]                       # the host sends these before the render
+        miss = [f for f in miss if f not in sizes and not bundled_here(f, datafiles)]
+        if sent:
+            need = sum(sizes[f] for f in sent)
+            try:
+                os.makedirs(_ROOT, exist_ok=True)
+                free = shutil.disk_usage(_ROOT).free
+            except OSError:
+                free = None
+            if free is not None and free < need + (2 << 30):
+                res["copy_error"] = "its temporary folder has no room for the %s it would be sent" % _size_text(need)
+                miss = sent + miss
+            else:
+                res["copy"] = [len(sent), need, [(split_any(f)[1] or [f])[-1] for f in sent[:9]]]
         res["missing"] = [(split_any(f)[1] or [f])[-1] for f in miss[:9]]
         res["nmissing"] = len(miss)
         out = map_path(pre["outdir"], maps)
@@ -4262,6 +4420,11 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
         name="Placeholders", default=True,
         description="Put a 0 KB file in place of each frame while it renders, so you can see which frames are "
                     "taken. Frames are handed out by the host either way, so none is ever rendered twice")
+    copy_missing: BoolProperty(
+        name="Copy Missing Files", default=True,
+        description="When another computer can't find a file this scene uses (a texture, a linked .blend ...), "
+                    "send it there from this computer before that computer renders. The copy is kept in its "
+                    "temporary folder. Files over 4 GB and file sequences are never sent")
     overwrite: BoolProperty(
         name="Overwrite", default=False,
         description="Render frames that already exist again. Off: they're skipped, so Render carries on where "
@@ -4361,6 +4524,32 @@ def _external_files():
             if idb.filepath and not getattr(idb, "packed_file", None):
                 add(idb.filepath, getattr(idb, "library", None))
     return sorted(have), sorted(set(os.path.basename(m) for m in missing))
+
+
+def _sendable(files):
+    """Of the files this scene uses, the ones that may be sent to a computer that can't find them:
+    {path: size}. Not file sequences (only their first file is known here) and nothing over 4 GB."""
+    seq = set()
+    for coll in ("cache_files", "volumes"):
+        for idb in getattr(bpy.data, coll, []):
+            if getattr(idb, "is_sequence", False) and idb.filepath:
+                try:
+                    seq.add(bpy.path.abspath(idb.filepath, library=getattr(idb, "library", None)))
+                except Exception:
+                    pass
+    out = {}
+    for f in files:
+        try:
+            n = os.path.getsize(f)
+        except OSError:
+            continue
+        if f not in seq and os.path.isfile(f) and n <= FILE_MAX:
+            out[f] = n
+    return out
+
+
+def _size_text(n):
+    return "%.1f GB" % (n / float(1 << 30)) if n >= 1 << 30 else "%.0f MB" % max(1.0, n / float(1 << 20))
 
 
 def _needs():
@@ -4477,7 +4666,8 @@ def _precheck(context, prefs):
             f.write("x")
         rpc(addr, {"op": "precheck", "pre": {
             "id": pid, "host": me, "blend": {"path": bpy.data.filepath, "size": os.path.getsize(bpy.data.filepath)},
-            "files": files[:500], "outdir": outdir, "probe": probe, "needs": _needs(), "datafiles": _datafiles()}},
+            "files": files[:500], "outdir": outdir, "probe": probe, "needs": _needs(), "datafiles": _datafiles(),
+            "copy": _sendable(files[:500]) if prefs.copy_missing else None}},
             timeout=4)
         t0 = time.time()
         while time.time() - t0 < _TEST.get("pre_wait", 14):     # the other computers answer within a few seconds
@@ -4511,9 +4701,15 @@ def _precheck(context, prefs):
             if r.get("needs"):
                 lines.append(('CANCEL', "%s can't take part: the %s add-on isn't enabled there"
                               % (name, ", ".join(r["needs"]))))
+            if r.get("copy"):
+                n, size, names = r["copy"]
+                lines.append(('IMPORT', "%s gets %d file%s from this computer first (%s):"
+                              % (name, n, "" if n == 1 else "s", _size_text(size))))
+                lines += _names(names, total=n)
             if r.get("nmissing"):
                 n = r["nmissing"]
-                lines.append(('ERROR', "%s can't find %d file%s that this computer has:" % (name, n, "" if n == 1 else "s")))
+                lines.append(('ERROR', "%s can't find %d file%s that this computer has%s:"
+                              % (name, n, "" if n == 1 else "s", " (%s)" % r["copy_error"] if r.get("copy_error") else "")))
                 lines += _names(r.get("missing") or [], total=n)
     return lines
 
@@ -4564,8 +4760,8 @@ class MULTIGPU_OT_render(bpy.types.Operator):
             except Exception:
                 pass
         _A["warn_lines"] = lines
-        if not lines:
-            return self.execute(context)
+        if not any(icon not in ('IMPORT', 'BLANK1') for icon, _t in lines):
+            return self.execute(context)               # nothing wrong (files to copy over aren't a problem)
         wm = context.window_manager
         try:
             return wm.invoke_props_dialog(self, width=660, title="MultiGPU: check before rendering",
@@ -4621,7 +4817,9 @@ class MULTIGPU_OT_render(bpy.types.Operator):
                          "format": _format(prefs), "ext": bool(rd.use_file_extension),
                          "compositing": bool(rd.use_compositing), "sequencer": bool(rd.use_sequencer),
                          "host_missing": [m.lower() for m in host_missing], "needs": _needs(),
-                         "datafiles": _datafiles()}}
+                         "datafiles": _datafiles(), "copy": bool(prefs.copy_missing)}}
+        if prefs.copy_missing:
+            spec["files"] = sorted(_sendable(files))
         try:
             r = rpc(addr, {"op": "start", "job": spec}, timeout=120)
         except OSError as e:
@@ -5216,6 +5414,7 @@ def _draw_advanced(box, prefs, running, sc=None):
     r = adv.row()
     r.prop(prefs, "persistent_data")
     r.prop(prefs, "save_first")
+    adv.prop(prefs, "copy_missing")
     if sc is not None:                                # Blender's own Post Processing settings of this scene
         adv.separator()
         adv.label(text="Post Processing (all cards use it)")

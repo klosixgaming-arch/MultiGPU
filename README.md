@@ -60,6 +60,10 @@ relative to the .blend, such as `//../renders/`, is the simplest.
 - **A card that drops out:** if a graphics card stops working, the others often get a new address
   from the system. MultiGPU follows each card to its new address, and stops a card with a clear
   message rather than letting Cycles quietly render its frames on the CPU.
+- **Copy Missing Files** (on by default): a texture or linked .blend that only the host has, for
+  example on its own disk, is sent to the computers that can't find it before they render. Not
+  file sequences, and nothing over 4 GB. A file that ships with Blender is taken from each
+  computer's own Blender.
 - **Host takeover:** if the host crashes or drops off the network mid-render, another computer
   becomes the host after about a minute. It removes the dead cards' placeholders and carries on.
   When the old host comes back, it joins as a helper by itself. Turn this off with
@@ -75,13 +79,14 @@ Tailscale). The connection between computers has no password or encryption.
 - Don't open or forward the MultiGPU port (47800 by default) to the internet.
 - Only join a host you trust: a joined computer opens the host's .blend and runs the Python
   scripts and drivers saved in it.
-- Anyone who can reach the host's port can join it and see the job's file paths.
+- Anyone who can reach the host's port can join it, see the job's file paths and, with
+  **Copy Missing Files** on, download the files the scene uses.
 
 ## Advanced options
 
 Output format (OpenEXR, OpenEXR multilayer, PNG or JPEG, each with its own settings; the default
 is OpenEXR, RGB, Float (Full), DWAA at 90%), Overwrite, Placeholders, Persistent Data,
-Save First, and the scene's Post Processing switches (Compositing and Sequencer).
+Save First, Copy Missing Files, and the scene's Post Processing switches (Compositing and Sequencer).
 
 **Show Render** opens a window per card showing its frame live, and **Arrange Windows** tiles
 them with your Blender window in a grid (Windows and Linux).
