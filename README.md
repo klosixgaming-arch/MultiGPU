@@ -5,14 +5,25 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.4.0** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.5.0** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
-1. Download `multigpu.py` from the [latest release](../../releases/latest).
-2. In Blender: **Edit › Preferences › Add-ons › Install from Disk**, pick `multigpu.py`, and tick it.
-3. Install the **same version on every computer**. Computers on different versions refuse to
-   work together.
+**Drag into Blender:** drag this link onto an open Blender window and confirm:
+
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.0.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+
+Blender asks once to add this page as a repository; say yes and it will also offer updates under
+**Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
+(Preferences › System › Network).
+
+**Or without online access:** download the `.zip` from the [latest release](../../releases/latest)
+and drag the file into Blender (or use **Preferences › Get Extensions › ⌄ › Install from Disk**).
+
+- Install the **same version on every computer**. Computers on different versions refuse to
+  work together.
+- Coming from the older single-file `multigpu.py`? Just install this one. It switches the old
+  add-on off and keeps your settings.
 
 The panel is in **Properties › Output › MultiGPU** and in the 3D Viewport sidebar (**N › MultiGPU**).
 

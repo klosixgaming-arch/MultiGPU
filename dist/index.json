@@ -1,0 +1,30 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "multigpu",
+      "name": "MultiGPU",
+      "tagline": "Render an animation on every GPU of every computer you own",
+      "version": "2.5.0",
+      "type": "add-on",
+      "maintainer": "klosixgaming-arch",
+      "license": [
+        "SPDX:GPL-3.0-or-later"
+      ],
+      "blender_version_min": "4.2.0",
+      "website": "https://github.com/klosixgaming-arch/MultiGPU",
+      "permissions": {
+        "network": "Talks to your other computers to share out the frames",
+        "files": "Reads the .blend and writes the rendered frames"
+      },
+      "tags": [
+        "Render"
+      ],
+      "archive_url": "./multigpu-2.5.0.zip",
+      "archive_size": 73828,
+      "archive_hash": "sha256:40b47d987b52dde2850ae004c17c28cb769ecdeac6d789c14874219cb615829c"
+    }
+  ]
+}

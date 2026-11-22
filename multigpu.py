@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 4, 0),
+    "version": (2, 5, 0),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -5284,9 +5284,96 @@ classes = (MULTIGPU_Device, MULTIGPU_Host, MULTIGPU_Prefs, MULTIGPU_OT_detect, M
 _HANDLERS = (("load_post", _on_load), ("save_pre", _on_save_pre), ("save_post", _on_save_post))
 
 
-def register():
+_LEGACY = "multigpu"                                # the module name of the old single-file install
+_REG = {"on": False}
+
+
+def _legacy_on():
+    """True in the drag-in (extension) install while the old single-file add-on is still enabled."""
+    try:
+        return __name__ != _LEGACY and _LEGACY in bpy.context.preferences.addons
+    except Exception:
+        return False
+
+
+def _prefs_dump(p):
+    out = {}
+    for pr in p.bl_rna.properties:
+        k = pr.identifier
+        if k in ("rna_type", "bl_idname") or pr.is_readonly and pr.type != 'COLLECTION':
+            continue
+        try:
+            if pr.type == 'COLLECTION':
+                out[k] = [dict((q.identifier, getattr(it, q.identifier)) for q in it.bl_rna.properties
+                               if q.identifier != "rna_type") for it in getattr(p, k)]
+            elif pr.type in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
+                out[k] = getattr(p, k)
+        except Exception:
+            pass
+    return out
+
+
+def _prefs_load(p, data):
+    for k, v in data.items():
+        try:
+            if isinstance(v, list):
+                col = getattr(p, k)
+                col.clear()
+                for row in v:
+                    it = col.add()
+                    for a, b in row.items():
+                        if a != "rna_type":
+                            try:
+                                setattr(it, a, b)
+                            except Exception:
+                                pass
+            else:
+                setattr(p, k, v)
+        except Exception:
+            pass
+
+
+def _replace_legacy():
+    """The old single-file MultiGPU is still enabled: keep its settings, switch it off and take its place."""
+    import addon_utils
+    if _REG["on"]:
+        return None
+    if _legacy_on():
+        old = sys.modules.get(_LEGACY)
+        try:
+            st = old._status() if old else None
+            if ((st or {}).get("job") or {}).get("state") == "running":
+                return 10.0                          # never swap in the middle of a render
+        except Exception:
+            pass
+        data = {}
+        try:
+            data = _prefs_dump(bpy.context.preferences.addons[_LEGACY].preferences)
+        except Exception:
+            pass
+        try:
+            addon_utils.disable(_LEGACY, default_set=True)
+        except Exception:
+            traceback.print_exc()
+        if _legacy_on():
+            return 10.0
+        _register()
+        p = _prefs()
+        if p is not None and data:
+            _prefs_load(p, data)
+        _mark_dirty()
+        print("MultiGPU: replaced the old multigpu.py install and kept its settings")
+        return None
+    _register()
+    return None
+
+
+def _register():
+    if _REG["on"]:
+        return
     for c in classes:
         bpy.utils.register_class(c)
+    _REG["on"] = True
     if os.environ.get("MULTIGPU_WORKER"):          # this Blender is one of the cards: stay passive
         return
     for name, fn in _HANDLERS:
@@ -5298,7 +5385,20 @@ def register():
     bpy.app.timers.register(_agent_tick, first_interval=1.0, persistent=True)
 
 
+def register():
+    if _legacy_on():                               # two copies can't both be active
+        if not (bpy.app.background or os.environ.get("MULTIGPU_WORKER")):
+            bpy.app.timers.register(_replace_legacy, first_interval=0.5, persistent=True)
+        return
+    _register()
+
+
 def unregister():
+    if bpy.app.timers.is_registered(_replace_legacy):
+        bpy.app.timers.unregister(_replace_legacy)
+    if not _REG["on"]:
+        return
+    _REG["on"] = False
     _A["quit"].set()
     for f in (_agent_tick, _startup):
         if bpy.app.timers.is_registered(f):

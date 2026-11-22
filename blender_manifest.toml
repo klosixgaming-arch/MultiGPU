@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "multigpu"
+version = "2.5.0"
+name = "MultiGPU"
+tagline = "Render an animation on every GPU of every computer you own"
+maintainer = "klosixgaming-arch"
+type = "add-on"
+website = "https://github.com/klosixgaming-arch/MultiGPU"
+tags = ["Render"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Talks to your other computers to share out the frames"
+files = "Reads the .blend and writes the rendered frames"
