@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.5.1** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.5.2** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.1.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.2.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
@@ -70,6 +70,10 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   computer's own Blender.
 - **Broken links are named before the render:** a file that the host itself can't find can't be
   sent, so the check before the render lists it by name.
+- **Smart Finish** (on by default): the last frames go to the cards that finish them soonest.
+  A slow card doesn't start a frame that the faster cards would have finished before it, and a
+  fast card with nothing left to do also renders a frame a slow card still needs long for; the
+  first one done counts.
 - **Host takeover:** if the host crashes or drops off the network mid-render, another computer
   becomes the host after about a minute. It removes the dead cards' placeholders and carries on.
   When the old host comes back, it joins as a helper by itself. Turn this off with
@@ -92,7 +96,7 @@ Tailscale). The connection between computers has no password or encryption.
 
 Output format (OpenEXR, OpenEXR multilayer, PNG or JPEG, each with its own settings; the default
 is OpenEXR, RGB, Float (Full), DWAA at 90%), Overwrite, Placeholders, Persistent Data,
-Save First, Copy Missing Files, and the scene's Post Processing switches (Compositing and Sequencer).
+Save First, Copy Missing Files, Smart Finish, and the scene's Post Processing switches (Compositing and Sequencer).
 
 **Show Render** opens a window per card showing its frame live, and **Arrange Windows** tiles
 them with your Blender window in a grid (Windows and Linux).

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 5, 1),
+    "version": (2, 5, 2),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -861,12 +861,14 @@ exec(compile(SHARED, "multigpu_shared", "exec"))
 # going if the host's Blender is closed, and is restarted from its saved state if it dies.
 # ======================================================================================
 COORD = r'''
-import base64, threading, traceback, socket, uuid, zlib
+import base64, heapq, threading, traceback, socket, uuid, zlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 LEASE = 90          # seconds without any sign of life before a card's frame goes to another card
 VERIFY_GRACE = 150  # seconds a finished frame may take to show up in the host's output folder
 HANG_MIN = 600      # a frame must have taken at least this long before an idle card also tries it
+HOLD_MARGIN = 0.9   # a slow card leaves the last frames alone only if the others finish them clearly sooner
+RESCUE_MARGIN = 1.25    # a free card also renders a slow card's frame only if it will clearly be done first
 LOCK_EVERY = 15     # seconds between refreshes of the marker in the output folder
 LOCK_TRUST = 40     # no frames are handed out once the marker couldn't be confirmed for this long
 LIVE = ("loading", "ready", "rendering", "idle", "reloading", "restarting")
@@ -1074,6 +1076,81 @@ class Coordinator(object):
     def hang_limit(self):
         slow = self.job.get("slowest")
         return max(HANG_MIN, 3.0 * slow) if slow else None
+
+    # ---- the last frames go to whoever finishes them soonest ------------------------------
+    def pace(self, c, t):
+        """(seconds until the card is free, seconds it needs for a frame). None while that isn't known, or
+        when its frame is far over its usual time and it can't be counted on."""
+        a = c.get("avg")
+        if not a:
+            return None
+        if c.get("frame") is not None and c.get("frame_t"):
+            e = t - c["frame_t"]
+            return None if e > 2 * a + 30 else (max(0.0, a - e), a)
+        return (0.0, a)
+
+    def others_finish(self, card, n, t, before):
+        """When the other cards would have n more frames done between them, each frame going to the card that
+        finishes it soonest. None if that isn't within `before` seconds."""
+        heap = []
+        for c in self.active_cards():
+            p = None if c is card else self.pace(c, t)
+            if p:
+                heapq.heappush(heap, (p[0] + p[1], p[1]))
+        end = 0.0
+        for _ in range(n):
+            if not heap:
+                return None
+            end, a = heapq.heappop(heap)
+            if end >= before:
+                return None
+            heapq.heappush(heap, (end + a, a))
+        return end
+
+    def hold_back(self, card, t):
+        """Near the end, a slow card doesn't start a frame when the faster cards will have finished every frame
+        that is left before it could finish one: the render ends sooner without it. If they turn out not to
+        (a card dropped out, the frames got heavier), the card goes back to work."""
+        j, a = self.job, card.get("avg")
+        if not j["opts"].get("smart_finish", True) or not a or card.get("hold_off"):
+            return False
+        n = sum(1 for f in j["frames"] if self.fs(f)["s"] == "todo")
+        end = self.others_finish(card, n, t, HOLD_MARGIN * a)
+        if end is None:
+            card["held"] = None
+            return False
+        if not card.get("held"):
+            card["held"] = t + end * 1.5 + 15
+            self.event("%s leaves the last %d frame%s to the faster cards (it needs %s a frame, they'll be done in %s)"
+                       % (self.label(card), n, "" if n == 1 else "s", _dur(a), _dur(end)))
+        elif t > card["held"]:
+            card.update(held=None, hold_off=True)
+            self.event("%s is rendering again: the last frames are taking longer than expected" % self.label(card))
+            return False
+        return True
+
+    def pick_rescue(self, card, t):
+        """Nothing is left to hand out, but a slower card will need much longer for its frame than this free
+        card would for the same frame: render it here too. Whichever finishes first counts."""
+        a = card.get("avg")
+        if not self.job["opts"].get("smart_finish", True) or not a:
+            return None
+        best = None
+        for f in self.job["frames"]:
+            st = self.fs(f)
+            if st["s"] != "busy" or st.get("card") == card["id"] or card["id"] in (st.get("fails") or ()) \
+                    or st.get("nbackup", 0) >= 2:
+                continue
+            b = self.cards.get(st.get("backup") or "")
+            h = self.cards.get(st.get("card") or "")
+            if h is None or (b is not None and b.get("frame") == f):
+                continue
+            e = t - (st.get("t") or t)
+            # what it still needs; with no pace known, or once it is over its usual time, how long it has been at it
+            left = h["avg"] - e if h.get("avg") and e < h["avg"] else (e - h["avg"] if h.get("avg") else e)
+            if left > a * RESCUE_MARGIN and (best is None or left > best[0]):
+                best = (left, f)
+        return best[1] if best else None
 
     def pick_backup(self, card, t):
         """Nothing is left to hand out: a frame another card has been on for far too long (it may be
@@ -1455,11 +1532,18 @@ class Coordinator(object):
                 self.event("%s stopped: %s" % (self.label(card), card["err"]))
                 return {"exit": "error", "why": card["err"]}
             f = self.pick(card)
+            if f is not None and self.hold_back(card, t):
+                card["phase"] = "idle"
+                return {"wait": 3, "why": "the faster cards will finish the rest sooner"}
+            card["held"] = None
             if f is None:
                 if self.check_finished():
                     card["phase"] = "done"
                     return {"exit": "done"}
                 b = self.pick_backup(card, t)
+                stuck = b is not None
+                if b is None:
+                    b = self.pick_rescue(card, t)
                 if b is not None:
                     st = self.fs(b)
                     old = self.cards.get(st.get("backup") or "")
@@ -1469,8 +1553,12 @@ class Coordinator(object):
                     st["nbackup"] = st.get("nbackup", 0) + 1
                     card.update(frame=b, frame_t=t, phase="rendering", backup=True, at=[j["id"], req.get("sync")])
                     first = self.cards.get(st.get("card") or "") or {}
-                    self.event("Frame %d has taken %s on %s; %s is rendering it too in case it's stuck"
-                               % (b, _dur(t - (st.get("t") or t)), self.label(first), self.label(card)))
+                    if stuck:
+                        self.event("Frame %d has taken %s on %s; %s is rendering it too in case it's stuck"
+                                   % (b, _dur(t - (st.get("t") or t)), self.label(first), self.label(card)))
+                    else:
+                        self.event("Frame %d is slow on %s; %s is free and rendering it too, the first one done counts"
+                                   % (b, self.label(first), self.label(card)))
                     return {"frame": b}
                 card["phase"] = "idle"
                 return {"wait": 3}
@@ -1493,8 +1581,9 @@ class Coordinator(object):
             card["last_fail"] = None
             card["done"] = card.get("done", 0) + 1
             secs = rep.get("secs")
-            if secs:
-                card["avg"] = secs if not card.get("avg") else card["avg"] * 0.7 + secs * 0.3
+            if secs:                              # a card's first frame includes loading the scene onto it:
+                first = card["done"] <= 2          # it is forgotten as soon as there is a second one
+                card["avg"] = secs if first or not card.get("avg") else card["avg"] * 0.7 + secs * 0.3
                 j["slowest"] = max(j.get("slowest") or 0, secs)
             if st["s"] != "done":
                 limit = self.hang_limit()
@@ -1612,7 +1701,7 @@ class Coordinator(object):
             for c in self.cards.values():
                 c.update(frame=None, frame_t=None, phase="off", stopped=False, streak=0, done=0, err=None,
                          warn=None, at=None, last_rid=None, last_fail=None, last_err=None, backup=False,
-                         restart=False, tile=None)
+                         restart=False, tile=None, avg=None, held=None, hold_off=False)
             for comp in self.computers.values():
                 comp.update(bad=0, blocked=None)
             self.no_live = None
@@ -1768,6 +1857,7 @@ class Coordinator(object):
                               "done": c.get("done", 0), "avg": c.get("avg"), "stopped": c.get("stopped"),
                               "err": c.get("err"), "warn": c.get("warn"),
                               "backup": bool(c.get("backup") and c.get("frame") is not None),
+                              "held": bool(c.get("held")),
                               "slow": bool(limit and secs and secs > limit)})
             if not online and t - comp.get("seen", 0) > 600 and not any(x["phase"] in LIVE for x in cards):
                 continue
@@ -4634,6 +4724,11 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
         name="Placeholders", default=True,
         description="Put a 0 KB file in place of each frame while it renders, so you can see which frames are "
                     "taken. Frames are handed out by the host either way, so none is ever rendered twice")
+    smart_finish: BoolProperty(
+        name="Smart Finish", default=True,
+        description="Give the last frames to the cards that finish them soonest. A slow card doesn't start a "
+                    "frame that the faster cards would have finished before it, and a fast card with nothing "
+                    "left to do also renders a frame a slow card still needs long for (the first one done counts)")
     copy_missing: BoolProperty(
         name="Copy Missing Files", default=True,
         description="When another computer can't find a file this scene uses (a texture, an image sequence, a "
@@ -5062,7 +5157,8 @@ class MULTIGPU_OT_render(bpy.types.Operator):
                          "format": _format(prefs), "ext": bool(rd.use_file_extension),
                          "compositing": bool(rd.use_compositing), "sequencer": bool(rd.use_sequencer),
                          "host_missing": [m.lower() for m in host_missing], "needs": _needs(),
-                         "datafiles": _datafiles(), "copy": bool(prefs.copy_missing)}}
+                         "datafiles": _datafiles(), "copy": bool(prefs.copy_missing),
+                         "smart_finish": bool(prefs.smart_finish)}}
         if prefs.copy_missing:
             spec["files"] = sorted(_sendable(files))
             spec["sets"] = sets
@@ -5392,6 +5488,8 @@ def _card_text(c):
         return s + done
     if ph == "error":
         return "error: %s" % (c.get("err") or "see log")
+    if ph == "idle" and c.get("held"):
+        return "waiting (faster cards finish the rest)" + done
     return _PHASE.get(ph, ph) + done
 
 
@@ -5661,6 +5759,7 @@ def _draw_advanced(box, prefs, running, sc=None):
     r.prop(prefs, "persistent_data")
     r.prop(prefs, "save_first")
     adv.prop(prefs, "copy_missing")
+    adv.prop(prefs, "smart_finish")
     if sc is not None:                                # Blender's own Post Processing settings of this scene
         adv.separator()
         adv.label(text="Post Processing (all cards use it)")
