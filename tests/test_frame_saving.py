@@ -16,7 +16,7 @@ class FrameSavingTests(unittest.TestCase):
         self.src, self.dst = self.root / "render.exr", self.root / "final.exr"
         self.src.write_bytes(b"new complete frame")
         self.dst.write_bytes(b"previous good frame")
-        self.ns = functions(script("WORKER"), ["move_into_place"],
+        self.ns = functions(script("WORKER"), ["move_into_place", "swap_in"],
                             dict(os=os, shutil=shutil, tempfile=tempfile, AWAY=False))
 
     def test_replaces_existing_frame(self):

@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.6.0** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.6.1** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.6.0.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.6.1.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
@@ -86,6 +86,10 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   saves the file and has each card reload it after its current frame.
   If the connection drops after saving, MultiGPU retries notifying the host automatically,
   without saving again or blocking the interface on the acknowledgement.
+
+- **Ctrl+S on a computer that only helps:** saving the file being rendered on any computer other
+  than the host doesn't change it. The save goes to `<name> (saved on <computer>).blend` next to it,
+  and the render carries on.
 
 ## Where your files go
 

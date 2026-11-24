@@ -25,12 +25,12 @@ class DownloadTests(unittest.TestCase):
         self.requests, self.messages = [], []
         self.fail_offsets = set()
         self.change_at = None
-        self.ns = functions(script("WORKER"), ["fetch_one"], dict(
+        self.ns = functions(script("WORKER"), ["fetch_one", "_drop_quiet"], dict(
             os=os, base64=base64, shutil=shutil, json=json, threading=threading,
             time=types.SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=lambda _: None),
             host_addr=lambda: "host:47800", local_name=lambda _: "texture.bin",
             cache_dir=lambda _: str(self.cache), strip_tail=lambda p, n: p,
-            FILE_CHUNK=1 << 20, FILE_MAX=4 << 30, COPIED=[0, 0],
+            FILE_CHUNK=1 << 20, FILE_MAX=4 << 30, COPIED=[0, 0], PACE=[64 << 10],
             log=self.messages.append, put=lambda **kw: self.messages.append(kw), rpc=self.rpc))
 
     def rpc(self, addr, req, timeout):
@@ -132,6 +132,12 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(observed, [True])
 
     def test_complete_partial_is_revalidated_before_publish(self):
+        # A complete copy left behind by an interrupted run is checked against the host once more.
+        self.cache.mkdir(parents=True)
+        (self.cache / "texture.bin.part").write_bytes(self.data)
+        (self.cache / "texture.bin.part.json").write_text(json.dumps({
+            "path": "/project/texture.bin", "size": len(self.data), "mtime": self.mtime,
+            "stamp": [len(self.data), int(self.mtime * 1e9)]}), encoding="utf-8")
         rpc = self.rpc
         calls = []
         def changed_at_end(addr, req, timeout):

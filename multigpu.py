@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 6, 0),
+    "version": (2, 6, 1),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -135,7 +135,7 @@ def from_ranges(ranges):
     return [f for a, b in ranges or [] for f in range(a, b + 1)]
 
 
-FILE_CHUNK = 1 << 20           # files only the host has are sent to the other computers in pieces of this size
+FILE_CHUNK = 4 << 20           # files only the host has are sent to the other computers in pieces of at most this size
 FILE_MAX = 4 << 30             # ... and never if they are bigger than this
 FILES_MAX = 20000              # the most files of one scene that are checked and can be sent
 
@@ -2769,11 +2769,21 @@ def fetch_one(hp):
     name = local_name(hp)
     d = cache_dir(strip_tail(hp, 1))
     dst, lock = os.path.join(d, name), os.path.join(d, name + ".lock")
-    tmp, meta = dst + ".part", dst + ".part.json"
+    tmp, meta, idf = dst + ".part", dst + ".part.json", dst + ".id"
     identity = {"path": hp, "size": size, "mtime": mtime, "stamp": stamp}
 
     def good():
-        return os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 0.000001
+        """The copy here is the host's current version: by the exact version the host gave when it was copied,
+        or (from an older host) by size and time, within 2 s as some disks keep coarse file times."""
+        if not os.path.isfile(dst) or os.path.getsize(dst) != size:
+            return False
+        if stamp is not None:
+            try:
+                with open(idf, encoding="utf-8") as f:
+                    return json.load(f) == stamp
+            except (OSError, ValueError):
+                return False
+        return abs(os.path.getmtime(dst) - mtime) < 2
     mine = False
     stop, heartbeat = threading.Event(), None
 
@@ -2821,10 +2831,10 @@ def fetch_one(hp):
                 pass
             with open(meta, "w", encoding="utf-8") as f:
                 json.dump(identity, f)
-        chunk = min(FILE_CHUNK, 64 << 10)
+        fetched = False
         with open(tmp, "ab") as f:
             while got < size:
-                want = min(chunk, size - got)
+                want = min(PACE[0], size - got)       # the size that suited the connection last time
                 for attempt in range(4):
                     t0 = time.monotonic()
                     try:
@@ -2837,6 +2847,7 @@ def fetch_one(hp):
                         os.utime(lock, None)
                         time.sleep(2 ** attempt)
                         want = max(1, min(size - got, max(16 << 10, want // 2)))
+                        PACE[0] = max(16 << 10, want)
                 data = base64.b64decode(r.get("data") or "", validate=True) if r.get("ok") else b""
                 if not data or len(data) > want or int(r.get("size", -1)) != size \
                         or r.get("mtime") != mtime or (stamp is not None and r.get("stamp") != stamp):
@@ -2849,18 +2860,26 @@ def fetch_one(hp):
                 f.write(data)
                 f.flush()
                 got += len(data)
+                fetched = True
                 os.utime(lock, None)
                 elapsed = max(0.001, time.monotonic() - t0)
-                chunk = min(FILE_CHUNK, max(16 << 10, min(want * 2, int(len(data) * 5 / elapsed))))
+                # about 5 s a piece: bigger on a fast link (fewer round trips), smaller on a slow one
+                PACE[0] = min(FILE_CHUNK, max(16 << 10, min(max(want, PACE[0]) * 2, int(len(data) * 5 / elapsed))))
                 put(state="copying %s: %.1f / %.1f MB" % (name, got / (1 << 20), size / (1 << 20)))
-        # Revalidate even a complete partial file left behind by an interrupted publish.
-        r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
-        if not r.get("ok") or r.get("size") != size or r.get("mtime") != mtime \
-                or (stamp is not None and r.get("stamp") != stamp):
-            os.remove(meta)
-            raise OSError("the file changed during the copy")
+        if not fetched:
+            # A complete copy left over from an interrupted run: make sure it is still the host's version.
+            # (Pieces fetched now were each checked against the host's version as they were read.)
+            r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
+            if not r.get("ok") or r.get("size") != size or r.get("mtime") != mtime \
+                    or (stamp is not None and r.get("stamp") != stamp):
+                os.remove(meta)
+                raise OSError("the file changed during the copy")
         os.utime(tmp, (mtime, mtime))
+        _drop_quiet(idf)
         os.replace(tmp, dst)
+        if stamp is not None:
+            with open(idf, "w", encoding="utf-8") as f:
+                json.dump(stamp, f)
         COPIED[0] += 1
         COPIED[1] += size
         return dst
@@ -2877,6 +2896,13 @@ def fetch_one(hp):
                 os.remove(q)
             except OSError:
                 pass
+
+
+def _drop_quiet(p):
+    try:
+        os.remove(p)
+    except OSError:
+        pass
 
 
 def fetch(p, raw=None, lib=None):
@@ -2901,6 +2927,7 @@ def fetch(p, raw=None, lib=None):
 
 STORE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(cfg["status"])))), "files")
 COPIED = [0, 0]
+PACE = [1 << 20]                # piece size for copies from the host, learned from how fast they arrive
 
 
 def find_missing():
@@ -3150,15 +3177,40 @@ def move_into_place(src, dst):
     os.close(fd)
     try:
         shutil.copyfile(src, part)
+        try:                                          # the staging file was made private: give the frame
+            shutil.copymode(src, part)                # the same permissions as a normally saved one
+        except OSError:
+            pass
         if os.path.getsize(part) != os.path.getsize(src):
             raise OSError("copying %s didn't finish" % os.path.basename(dst))
-        os.replace(part, dst)
+        try:
+            os.replace(part, dst)
+        except OSError:
+            if not os.path.exists(dst):
+                raise
+            swap_in(part, dst)
     finally:
         try:
             os.remove(part)
         except OSError:
             pass
     os.remove(src)
+
+
+def swap_in(new, dst):
+    """For a share that can't rename over an existing file: move the old file aside, move the new one in,
+    then delete the old one. If moving the new one in fails, the old one goes back."""
+    aside = "%s.multigpu-old-%d" % (dst, os.getpid())
+    os.rename(dst, aside)
+    try:
+        os.rename(new, dst)
+    except OSError:
+        os.rename(aside, dst)
+        raise
+    try:
+        os.remove(aside)
+    except OSError:
+        pass
 
 
 def collect(final, tmp):
@@ -4825,10 +4877,89 @@ def _save_now(token, scene_name=None):
         _A["saving"] = False
 
 
+def _is_render_file(path, job):
+    """Is `path` this computer's copy of the .blend being rendered?"""
+    if not path or not os.path.isfile(path):
+        return False
+    here = _blend_here(job)
+    if here:
+        if _same_file(path, here):
+            return True
+        try:
+            return os.path.samefile(path, here)       # the same file by another name (a drive letter, a link)
+        except OSError:
+            return False
+    b = job.get("blend") or {}                      # this computer couldn't take part: go by name and size
+    try:
+        return os.path.basename(path).lower() == (b.get("name") or "").lower() and os.path.getsize(path) == b.get("size")
+    except OSError:
+        return False
+
+
+def _saved_copy_name(path):
+    stem, ext = os.path.splitext(path)
+    return "%s (saved on %s)%s" % (stem, re.sub(r'[\\/:*?"<>|]', "_", _computer_name()), ext or ".blend")
+
+
+def _keep_render_file(target, job):
+    """Ctrl+S on a computer that only helps: Blender is about to write over the file every computer renders.
+    Keep the file as it is (a second name for it, or a copy) so it can go back once Blender has saved."""
+    if not _is_render_file(target, job):
+        return
+    d = os.path.dirname(target)
+    try:                                              # leftovers of a Blender that crashed while saving
+        for n in os.listdir(d):
+            if n.startswith(".multigpu-keep-") and time.time() - os.path.getmtime(os.path.join(d, n)) > 3600:
+                os.remove(os.path.join(d, n))
+    except OSError:
+        pass
+    keep = os.path.join(d, ".multigpu-keep-%s.blend" % uuid.uuid4().hex[:8])
+    try:
+        os.link(target, keep)                         # instant, and the file is never missing
+    except (OSError, AttributeError, NotImplementedError):
+        shutil.copy2(target, keep)
+    _A["divert"] = {"path": target, "keep": keep, "t": time.time()}
+
+
+def _restore_render_file():
+    """After Blender saved over the render's file: move the save to '<name> (saved on <computer>).blend' and
+    put the render's file back. The render goes on as if nothing happened, and nothing is lost."""
+    d = _A.pop("divert", None)
+    if not d:
+        return
+    path, keep = d["path"], d["keep"]
+    mine = _saved_copy_name(path)
+    try:
+        os.replace(path, mine)
+    except OSError as e:
+        _A["msg"] = "This file is being rendered: saving it here may stop this computer rendering (%s)" % (e.strerror or e)
+        _drop(keep)
+        return
+    try:
+        os.replace(keep, path)
+    except OSError as e:
+        try:
+            os.replace(mine, path)                    # never leave the render without its file
+        except OSError:
+            pass
+        _A["msg"] = "This file is being rendered: saving it here may stop this computer rendering (%s)" % (e.strerror or e)
+        _drop(keep)
+        return
+    _A["msg"] = "This file is being rendered, so your save went to \"%s\". The render carries on" % os.path.basename(mine)
+
+
+def _drop(p):
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
 @persistent
 def _on_save_pre(*args):
-    """Ctrl+S while rendering: the file on disk stops being what the cards render. Give it a new version
-    token, so no card can load it by accident before Sync Changes is pressed."""
+    """Ctrl+S while rendering: the file on disk stops being what the cards render. On the host it gets a new
+    version token, so no card can load it by accident before Sync Changes is pressed. On a computer that only
+    helps, the save goes to a file of its own instead."""
     try:
         if _A.get("saving"):
             return
@@ -4836,9 +4967,12 @@ def _on_save_pre(*args):
         mine = _A.get("host_job")                    # (a render started a moment ago isn't in the reply yet)
         if mine and _A.get("running_job") == mine["id"] and (not job or job.get("id") != mine["id"]):
             job = mine
-        if not job or job.get("state") != "running" or (job.get("host") != _computer_id() and not _origin_here(job)):
-            return
         target = args[0] if args and isinstance(args[0], str) else bpy.data.filepath
+        if job and job.get("state") == "running" and job.get("host") != _computer_id() and not _origin_here(job):
+            _keep_render_file(target, job)
+            return
+        if not job or job.get("state") != "running":
+            return
         here = _blend_here(job)
         if not _same_file(bpy.data.filepath, here) or not _same_file(target, here):
             return
@@ -4854,9 +4988,21 @@ def _on_save_pre(*args):
 
 @persistent
 def _on_save_post(*args):
+    if _A.get("divert"):
+        try:
+            _restore_render_file()
+        except Exception:
+            traceback.print_exc()
     if _A.pop("save_seen", None):
         _A["token_unsaved"] = False
         _A["unsynced_send"] = True
+
+
+@persistent
+def _on_save_fail(*args):
+    d = _A.pop("divert", None)                       # nothing was written: the render's file is untouched
+    if d:
+        _drop(d["keep"])
 
 
 def _redraw():
@@ -4871,6 +5017,10 @@ def _redraw():
 
 def _agent_tick():
     try:
+        d = _A.get("divert")
+        if d and time.time() - d["t"] > 300:          # the save never finished: forget the spare copy
+            _A.pop("divert", None)
+            _drop(d["keep"])
         prefs = _prefs()
         if prefs is None:
             return 2.0
@@ -6307,7 +6457,8 @@ classes = (MULTIGPU_Device, MULTIGPU_Host, MULTIGPU_Prefs, MULTIGPU_OT_detect, M
            MULTIGPU_OT_card_stop, MULTIGPU_OT_card_use, MULTIGPU_OT_card_resume, MULTIGPU_OT_stop, MULTIGPU_OT_join,
            MULTIGPU_OT_host_remove, MULTIGPU_OT_folder, MULTIGPU_OT_relative, MULTIGPU_OT_firewall, MULTIGPU_OT_clear,
            MULTIGPU_PT_output, MULTIGPU_PT_sidebar)
-_HANDLERS = (("load_post", _on_load), ("save_pre", _on_save_pre), ("save_post", _on_save_post))
+_HANDLERS = (("load_post", _on_load), ("save_pre", _on_save_pre), ("save_post", _on_save_post)) + \
+    ((("save_post_fail", _on_save_fail),) if hasattr(bpy.app.handlers, "save_post_fail") else ())
 
 
 _LEGACY = "multigpu"                                # the module name of the old single-file install
