@@ -1340,14 +1340,25 @@ class Coordinator(object):
         try:
             off, n = max(0, int(req.get("off") or 0)), max(0, min(int(req.get("n") or 0), FILE_CHUNK))
             st = os.stat(ent)
+            stamp = [st.st_size, st.st_mtime_ns]
+            if req.get("stamp") is not None and req["stamp"] != stamp:
+                return {"error": "the file changed during the copy"}
             data = b""
             if n:
                 with open(ent, "rb") as f:
+                    opened = os.fstat(f.fileno())
+                    if [opened.st_size, opened.st_mtime_ns] != stamp:
+                        return {"error": "the file changed during the copy"}
                     f.seek(off)
                     data = f.read(n)
+                    after = os.fstat(f.fileno())
+                current = os.stat(ent)
+                if any([s.st_size, s.st_mtime_ns] != stamp for s in (after, current)):
+                    return {"error": "the file changed during the copy"}
         except (OSError, ValueError, TypeError) as e:
             return {"error": "the host can't read it (%s)" % (getattr(e, "strerror", None) or e)}
-        return {"ok": True, "size": st.st_size, "mtime": st.st_mtime, "data": base64.b64encode(data).decode("ascii")}
+        return {"ok": True, "size": st.st_size, "mtime": st.st_mtime, "stamp": stamp,
+                "data": base64.b64encode(data).decode("ascii")}
 
     # ---- computers that work from their own copy of the folder (kept in step by a sync program) ----
     def away(self, comp_id):
@@ -1879,6 +1890,10 @@ class Coordinator(object):
             j = self.job
             if not j:
                 return {"error": "nothing is rendering"}
+            if req.get("job") is not None and req["job"] != j["id"]:
+                return {"error": "the render changed while saving"}
+            if req.get("token") == j["blend"].get("token"):
+                return {"ok": True}               # a lost acknowledgement can safely be retried
             j["blend"]["token"] = req.get("token")
             j["blend"]["size"] = req.get("size")
             if isinstance(req.get("files"), list):         # the saved scene may use other files now
@@ -1889,6 +1904,7 @@ class Coordinator(object):
             j["sync_pending"] = False
             j["unsynced"] = False
             j["synced_at"] = now()
+            self.dirty = True
             self.event("Changes synced; each card reloads after its frame")
             return {"ok": True}
 
@@ -2749,19 +2765,33 @@ def fetch_one(hp):
         log("the host didn't send %s: %s" % (local_name(hp), r.get("error")))
         return None
     size, mtime = int(r["size"]), float(r["mtime"])
+    stamp = r.get("stamp")
     name = local_name(hp)
     d = cache_dir(strip_tail(hp, 1))
-    dst, lock, tmp = os.path.join(d, name), os.path.join(d, name + ".lock"), os.path.join(d, "%s.%d.part" % (name, os.getpid()))
+    dst, lock = os.path.join(d, name), os.path.join(d, name + ".lock")
+    tmp, meta = dst + ".part", dst + ".part.json"
+    identity = {"path": hp, "size": size, "mtime": mtime, "stamp": stamp}
 
     def good():
-        return os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 2
+        return os.path.isfile(dst) and os.path.getsize(dst) == size and abs(os.path.getmtime(dst) - mtime) < 0.000001
     mine = False
+    stop, heartbeat = threading.Event(), None
+
+    def keep_lock():
+        while not stop.wait(10):
+            try:
+                os.utime(lock, None)
+            except OSError:
+                return
+
     try:
         os.makedirs(d, exist_ok=True)
         while not good():                             # one card at a time gets a file; the others wait for it
             try:
                 os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
                 mine = True
+                heartbeat = threading.Thread(target=keep_lock, daemon=True)
+                heartbeat.start()
                 break
             except FileExistsError:
                 try:
@@ -2774,19 +2804,61 @@ def fetch_one(hp):
         if good():
             os.utime(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(d)))), None)   # still in use
             return dst
-        if size > FILE_MAX or shutil.disk_usage(d).free < size + (2 << 30):
+        if size < 0 or size > FILE_MAX:
+            log("not copying %s from the host: invalid or oversized file" % name)
+            return None
+        try:
+            with open(meta, encoding="utf-8") as f:
+                resume = json.load(f) == identity and os.path.getsize(tmp) <= size
+        except (OSError, ValueError):
+            resume = False
+        got = os.path.getsize(tmp) if resume else 0
+        if shutil.disk_usage(d).free < size - got + (2 << 30):
             log("not copying %s from the host: no room for it in this computer's temporary folder" % name)
             return None
-        got = 0
-        with open(tmp, "wb") as f:
+        if not resume:
+            with open(tmp, "wb"):
+                pass
+            with open(meta, "w", encoding="utf-8") as f:
+                json.dump(identity, f)
+        chunk = min(FILE_CHUNK, 64 << 10)
+        with open(tmp, "ab") as f:
             while got < size:
-                r = rpc(host_addr(), {"op": "file", "path": hp, "off": got, "n": FILE_CHUNK}, timeout=60)
-                data = base64.b64decode(r.get("data") or "") if r.get("ok") else b""
-                if not data or int(r.get("size", -1)) != size:
+                want = min(chunk, size - got)
+                for attempt in range(4):
+                    t0 = time.monotonic()
+                    try:
+                        r = rpc(host_addr(), {"op": "file", "path": hp, "off": got,
+                                              "n": want, "stamp": stamp}, timeout=60)
+                        break
+                    except OSError:
+                        if attempt == 3:
+                            raise
+                        os.utime(lock, None)
+                        time.sleep(2 ** attempt)
+                        want = max(1, min(size - got, max(16 << 10, want // 2)))
+                data = base64.b64decode(r.get("data") or "", validate=True) if r.get("ok") else b""
+                if not data or len(data) > want or int(r.get("size", -1)) != size \
+                        or r.get("mtime") != mtime or (stamp is not None and r.get("stamp") != stamp):
+                    # A new version must never be appended to the old version's partial copy.
+                    try:
+                        os.remove(meta)
+                    except OSError:
+                        pass
                     raise OSError(r.get("error") or "the file changed or the copy stopped")
                 f.write(data)
+                f.flush()
                 got += len(data)
                 os.utime(lock, None)
+                elapsed = max(0.001, time.monotonic() - t0)
+                chunk = min(FILE_CHUNK, max(16 << 10, min(want * 2, int(len(data) * 5 / elapsed))))
+                put(state="copying %s: %.1f / %.1f MB" % (name, got / (1 << 20), size / (1 << 20)))
+        # Revalidate even a complete partial file left behind by an interrupted publish.
+        r = rpc(host_addr(), {"op": "file", "path": hp}, timeout=10)
+        if not r.get("ok") or r.get("size") != size or r.get("mtime") != mtime \
+                or (stamp is not None and r.get("stamp") != stamp):
+            os.remove(meta)
+            raise OSError("the file changed during the copy")
         os.utime(tmp, (mtime, mtime))
         os.replace(tmp, dst)
         COPIED[0] += 1
@@ -2796,7 +2868,11 @@ def fetch_one(hp):
         log("couldn't copy %s from the host: %s" % (name, e))
         return None
     finally:
-        for q in ([lock] if mine else []) + [tmp]:
+        stop.set()
+        if heartbeat is not None:
+            heartbeat.join()
+        # Keep partial bytes and their identity across retries and worker restarts.
+        for q in ([lock] if mine else []) + ([meta] if mine and good() else []):
             try:
                 os.remove(q)
             except OSError:
@@ -4659,33 +4735,53 @@ def _reconcile(prefs, r):
 
 
 def _sync_tick():
-    """Sync Changes: keep trying to save until no card is holding the file open."""
+    """Save once, then retry notifying the host off the UI thread until it acknowledges."""
     s = _A.get("sync")
     if not s:
         return
     t = time.time()
     if t < s["next"]:
         return
+    if s.get("payload") is not None:
+        reply = s.pop("reply", None)
+        if reply is not None:
+            r, error = reply
+            s.pop("notifying", None)
+            if error is not None:
+                s["next"] = t + 2
+                _A["msg"] = "Changes saved. Waiting to reach the host; retrying automatically: %s" % error
+                return
+            _A["sync"] = None
+            _A["msg"] = ("Saved, but couldn't sync: %s" % r["error"]) if r.get("error") else \
+                "Changes saved. Each card picks them up after its current frame"
+            return
+        if not s.get("notifying"):
+            s["notifying"] = True
+
+            def notify():
+                try:
+                    s["reply"] = (rpc(s["addr"], s["payload"]), None)
+                except OSError as e:
+                    s["reply"] = (None, str(e))
+
+            threading.Thread(target=notify, daemon=True).start()
+        return
     if not _same_file(bpy.data.filepath, s["blend"]):
         err, give_up = "this Blender now has a different file open than the one being rendered", True
     else:
         err, give_up = _save_now(s["token"], s["scene"]), t - s["t0"] > 40
     if err is None:
-        _A["sync"] = None
-        try:
-            more = {}
-            p = _prefs()
-            if p is not None and p.copy_missing:
-                try:
-                    sets = {}
-                    more = {"files": sorted(_sendable(_external_files(sets)[0])), "sets": sets}
-                except Exception:
-                    traceback.print_exc()
-            rpc(s["addr"], dict({"op": "sync_end", "token": s["token"], "size": os.path.getsize(bpy.data.filepath),
-                                 "computer": _computer_id()}, **more))
-            _A["msg"] = "Changes saved. Each card picks them up after its current frame"
-        except OSError as e:
-            _A["msg"] = "Saved, but couldn't tell the host: %s" % e
+        more = {}
+        p = _prefs()
+        if p is not None and p.copy_missing:
+            try:
+                sets = {}
+                more = {"files": sorted(_sendable(_external_files(sets)[0])), "sets": sets}
+            except Exception:
+                traceback.print_exc()
+        s["payload"] = dict({"op": "sync_end", "token": s["token"], "size": os.path.getsize(s["blend"]),
+                             "job": s["job"], "computer": _computer_id()}, **more)
+        _A["msg"] = "Changes saved. Notifying the host..."
     elif give_up:
         _A["sync"] = None
         try:
@@ -4712,9 +4808,11 @@ def _save_now(token, scene_name=None):
         win = wm.windows[0] if wm and wm.windows else None
         if win is not None:
             with bpy.context.temp_override(window=win):
-                bpy.ops.wm.save_mainfile()
+                result = bpy.ops.wm.save_mainfile()
         else:
-            bpy.ops.wm.save_mainfile()
+            result = bpy.ops.wm.save_mainfile()
+        if 'FINISHED' not in result:
+            raise RuntimeError("Blender cancelled saving the file")
         _A["token_unsaved"] = False
         return None
     except RuntimeError as e:
@@ -5524,11 +5622,12 @@ class MULTIGPU_OT_sync(bpy.types.Operator):
                 p["killed"] = t
                 p["relaunch"] = True
         _A["sync"] = {"t0": t, "next": t, "token": uuid.uuid4().hex, "scene": job["scene"], "blend": blend,
-                      "addr": addr}
+                      "addr": addr, "job": job["id"]}
         _A["unsynced_send"] = False
+        _A["msg"] = "Waiting for the cards to let go of the file..."
         _sync_tick()
         if _A.get("sync"):
-            self.report({'INFO'}, "Waiting for the cards to let go of the file...")
+            self.report({'INFO'}, _A.get("msg") or "Waiting for the cards to let go of the file...")
         else:
             self.report({'INFO'}, _A.get("msg") or "Changes saved")
         return {'FINISHED'}
@@ -5896,9 +5995,12 @@ def draw_ui(layout, context, prefs_only=False):
                     op = rr.operator("multigpu.join", text="Join", icon='LINKED')
                     op.leave, op.index = False, i
                     rr.operator("multigpu.host_remove", text="", icon='X').index = i
+        folder = box.column(align=True)
+        folder.enabled = not running
+        folder.prop(prefs, "shared_roots")
+        folder.label(text="Slow connection? Use a local synced project folder", icon='FILE_FOLDER')
         if prefs_only:
             box.prop(prefs, "port")
-            box.prop(prefs, "shared_roots")
     if _is_host_mode(prefs) and _A["fo"].get("msg"):
         _alert(box, _A["fo"]["msg"])
     if _is_host_mode(prefs) and _A.get("coord_err"):
@@ -5935,6 +6037,7 @@ def draw_ui(layout, context, prefs_only=False):
         if not bpy.data.filepath:
             notes.label(text="Save the .blend file first", icon='ERROR')
         else:
+            notes.prop(rd, "filepath", text="Frame output")
             notes.label(text="Frames save in  %s" % _short_dir(sc), icon='FILE_FOLDER')
             if prefs.mode == "HOST" and rd.filepath and not rd.filepath.startswith("//"):
                 rr = notes.row()
@@ -5958,7 +6061,9 @@ def draw_ui(layout, context, prefs_only=False):
             col.label(text=text)
         info = col.row()
         info.scale_y = 0.8
-        if job.get("sync_pending") or _A.get("sync"):
+        if (_A.get("sync") or {}).get("payload") is not None:
+            info.label(text="Changes saved; waiting for the host...", icon='FILE_REFRESH')
+        elif job.get("sync_pending") or _A.get("sync"):
             info.label(text="Saving your changes...", icon='FILE_REFRESH')
         elif job.get("eta"):
             info.label(text="%s left  |  done around %s" % (_fmt(job["eta"]), _clock(time.time() + job["eta"])),
