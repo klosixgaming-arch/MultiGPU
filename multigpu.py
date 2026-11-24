@@ -2361,7 +2361,7 @@ main()
 # The script each card's Blender runs: asks the host for a frame, renders it, repeats.
 # ======================================================================================
 WORKER = r'''
-import atexit, base64, hashlib, shutil, threading, traceback
+import atexit, base64, hashlib, shutil, tempfile, threading, traceback
 import bpy
 
 cfg = json.load(open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8"))
@@ -3065,21 +3065,23 @@ def move_into_place(src, dst):
         return
     except OSError:
         pass
+    # Another drive (or a NAS that can't rename from the worker folder): stage on the destination
+    # drive, then replace atomically. Never delete the previous frame before its replacement is ready.
+    # Each attempt owns its staging file, including when two cards race to finish a frame.
+    prefix = ".syncthing.%s." if AWAY else ".multigpu-copy.%s."
+    fd, part = tempfile.mkstemp(prefix=prefix % os.path.basename(dst), suffix=".tmp",
+                                dir=os.path.dirname(dst) or ".")
+    os.close(fd)
     try:
-        if os.path.exists(dst):
-            os.remove(dst)
-        os.rename(src, dst)
-        return
-    except OSError:
-        pass
-    # last resort (or another drive): copy, check, then swap in. In a synced folder under a name sync programs
-    # leave alone, so a half-written copy never travels.
-    part = os.path.join(os.path.dirname(dst), ".syncthing.%s.tmp" % os.path.basename(dst)) if AWAY \
-        else dst + ".multigpu-copy"
-    shutil.copyfile(src, part)
-    if os.path.getsize(part) != os.path.getsize(src):
-        raise OSError("copying %s didn't finish" % os.path.basename(dst))
-    os.replace(part, dst)
+        shutil.copyfile(src, part)
+        if os.path.getsize(part) != os.path.getsize(src):
+            raise OSError("copying %s didn't finish" % os.path.basename(dst))
+        os.replace(part, dst)
+    finally:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
     os.remove(src)
 
 
