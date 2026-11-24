@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.5.2** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.5.3** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.2.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.3.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on

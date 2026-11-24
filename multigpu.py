@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 5, 2),
+    "version": (2, 5, 3),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -1620,7 +1620,9 @@ class Coordinator(object):
             self.release(card)
             card["stopped"] = True
             card["phase"] = "stopped"
-            self.event("%s was %s by you" % (self.label(card), "cancelled" if why == "cancelled" else "closed"))
+            card["stop_why"] = why
+            self.event("%s stopped: %s" % (self.label(card), "its render was cancelled in its window"
+                                           if why == "cancelled" else "its window was closed"))
         elif why == "error":
             self.release(card)
             card["phase"] = "error"
@@ -1738,6 +1740,7 @@ class Coordinator(object):
             self.release(c)
             c["stopped"] = True
             c["phase"] = "stopped"
+            c["stop_why"] = None
             self.event("%s stopped by you" % self.label(c))
             return {"ok": True}
 
@@ -1855,6 +1858,7 @@ class Coordinator(object):
                 cards.append({"id": kid, "label": c.get("label"), "backend": c.get("backend"), "use": bool(c.get("use")),
                               "phase": self.phase(c, t), "frame": c.get("frame"), "secs": secs,
                               "done": c.get("done", 0), "avg": c.get("avg"), "stopped": c.get("stopped"),
+                              "stop_why": c.get("stop_why") if c.get("stopped") else None,
                               "err": c.get("err"), "warn": c.get("warn"),
                               "backup": bool(c.get("backup") and c.get("frame") is not None),
                               "held": bool(c.get("held")),
@@ -2875,7 +2879,7 @@ def log_error():
             continue
         if "out of memory" in low or "out of gpu memory" in low:
             return "out of GPU memory"
-        if "error" in low or "failed" in low:
+        if "error" in low or "failed" in low or "illegal address" in low or " in cuda " in low or " in optix " in low:
             best = line.strip()
     return best[-160:] if best else None
 
@@ -3119,8 +3123,13 @@ def _ui_step():
             f = U["frame"]
             rd.filepath = OUT
             if U["cancel"]:
-                leave("stopped", 0, why="cancelled")
-            U["report"] = report_for(f, U["t0"], U["final"], U["tmp"])
+                # Blender also "cancels" a render that failed (out of GPU memory, a driver error ...). So this is
+                # a failed frame, never taken as the user stopping the card: closing its window does that.
+                why = log_error()
+                U["report"] = report_for(f, U["t0"], error=RuntimeError(
+                    "the render was cancelled: " + (why or "Blender didn't say why (Esc in its window? see the card's log)")))
+            else:
+                U["report"] = report_for(f, U["t0"], U["final"], U["tmp"])
             ME["frame"] = None
             U["phase"] = "ask"
         if ME.pop("env_wait", None):
@@ -5488,6 +5497,8 @@ def _card_text(c):
         return s + done
     if ph == "error":
         return "error: %s" % (c.get("err") or "see log")
+    if ph == "stopped" and c.get("stop_why"):
+        return "stopped: its window was closed" if c["stop_why"] == "closed" else "stopped: render cancelled in its window"
     if ph == "idle" and c.get("held"):
         return "waiting (faster cards finish the rest)" + done
     return _PHASE.get(ph, ph) + done
