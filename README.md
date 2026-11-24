@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.6.1** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.6.2** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.6.1.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.6.2.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
@@ -41,6 +41,19 @@ process and takes the next free frame.
    Blender open. Joined hosts are remembered, and you can give them names. A computer can join
    while a render is already running; it just starts taking frames.
 3. Press **Render** on the host.
+
+### Let hosts pick a computer (no typing addresses)
+
+A joined computer keeps every host it has joined in its saved list. With **Let My Saved Hosts Pick
+This Computer** on (the default), it stays available to all of them, even when it isn't joined:
+
+- Each host lists it under **Can help this computer**. Press **Use** and it joins by itself, now
+  and whenever Blender is open on it. The host remembers the choice; the **X** lets it go again.
+- If two hosts pick the same computer, it stays with the one that is rendering. The other host sees
+  it as "next in line" and gets it as soon as that render is done.
+- Pressing **Leave** on the computer itself turns this off.
+
+The other computer only needs Blender open: its cards load the host's project by themselves.
 
 The .blend and the output folder must be on shared storage (a NAS, for example). Each computer
 finds the .blend by itself and converts the host's paths to its own, so `B:\Projects\...` on
@@ -139,7 +152,13 @@ Tailscale). The connection between computers has no password or encryption.
 
 Output format (OpenEXR, OpenEXR multilayer, PNG or JPEG, each with its own settings; the default
 is OpenEXR, RGB, Float (Full), DWAA at 90%), Overwrite, Placeholders, Persistent Data,
-Save First, Copy Missing Files, Smart Finish, and the scene's Post Processing switches (Compositing and Sequencer).
+Save First, Copy Missing Files, Smart Finish, Smallest Project File, and the scene's Post Processing switches (Compositing and Sequencer).
+
+**Smallest Project File** (on by default): whenever MultiGPU saves the .blend (at the start of a
+render and with Sync Changes) it compresses it as far as Blender can still open it, about a fifth
+smaller than Blender's own Compress option and often less than half the size of an uncompressed
+file. Every computer then loads less over the network. It runs in the background before the
+render starts, a few seconds per 100 MB, and the file opens just as fast.
 
 **Show Render** opens a window per card showing its frame live, and **Arrange Windows** tiles
 them with your Blender window in a grid (Windows and Linux).

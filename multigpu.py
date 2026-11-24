@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 6, 1),
+    "version": (2, 6, 2),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -78,6 +78,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -91,7 +92,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -949,6 +950,8 @@ class Coordinator(object):
         self.resumed_at = 0.0
         self.probes = []
         self.arrive_t = 0.0
+        self.offers = {}         # computers that let hosts pick them, and haven't joined this one
+        self.wanted = {}         # computer id -> name: the ones this host's user picked ("Use")
         self.pre = None
         self.awake = Awake()
         self.no_live = None
@@ -1317,6 +1320,26 @@ class Coordinator(object):
             return {"error": "only the host's own Blender can do that"}
         return fn(req, ip)
 
+    def op_offer(self, req, ip):
+        """A computer that lets hosts pick it says it is there (it hasn't joined this host). The answer says
+        whether this host's user picked it, and whether this host is rendering."""
+        c = req.get("computer") or {}
+        cid = c.get("id")
+        if not cid:
+            return {"error": "no computer id"}
+        bad = self.mismatch(c.get("addon"), c.get("name"))
+        if bad or c.get("protocol") != PROTOCOL:
+            return {"error": bad or "MultiGPU versions don't match. Install the same version on every computer."}
+        with self.lock:
+            t = now()
+            self.offers[cid] = {"id": cid, "name": c.get("name") or cid, "cards": [str(x) for x in c.get("cards") or []][:16],
+                                "t": t, "ip": ip, "state": req.get("state"), "with": req.get("with"),
+                                "place": req.get("place")}
+            j = self.job
+            host = next((x.get("name") for x in self.computers.values() if x.get("host") and t - x.get("seen", 0) < 30), None)
+            return {"ok": True, "want": cid in self.wanted, "running": bool(j and j["state"] == "running"),
+                    "name": host, "version": self.version}
+
     def mismatch(self, addon, name):
         if addon and addon != self.version:
             return ("MultiGPU versions don't match: the host has %s, %s has %s. Install the same version on "
@@ -1430,6 +1453,8 @@ class Coordinator(object):
             t = now()
             if c.get("is_host"):
                 self.host_seen = t
+                if isinstance(c.get("wanted"), list):
+                    self.wanted = dict((w[0], w[1]) for w in c["wanted"] if isinstance(w, list) and len(w) == 2)
             if c.get("viewer"):                    # a second Blender on a computer: it only looks
                 return {"ok": True, "now": t, "viewer": True, "job": self.job_brief(), "want": {}, "kill": [],
                         "maps": self.maps(cid), "status": self.status(), "uses": {}, "pre": None}
@@ -1461,7 +1486,7 @@ class Coordinator(object):
             self.dirty = True
             pre = self.pre if self.pre and t - self.pre["t"] < 120 and self.pre.get("host") != cid else None
             return {"ok": True, "now": t, "job": self.job_brief(), "want": self.want(cid), "kill": self.kill(cid),
-                    "maps": self.maps(cid), "status": self.status(), "pre": pre,
+                    "maps": self.maps(cid), "status": self.status(), "pre": pre, "wanted": cid in self.wanted,
                     "uses": {k: [bool(self.cards[k].get("use")), self.cards[k].get("use_v", 0)] for k in ids}}
 
     def proc_report(self, card, p, t):
@@ -1989,7 +2014,11 @@ class Coordinator(object):
                           "resolve_error": r.get("error") if j and r.get("job") == j["id"] and not r.get("ok") else None,
                           "resolving": bool(j and r.get("job") == j["id"] and r.get("busy")), "cards": cards,
                           "pre": pre, "ip": comp.get("ip")})
-        out = {"computers": comps, "events": self.events[-8:], "version": self.version, "now": t}
+        here = set(x["id"] for x in comps if x["online"])
+        offers = [dict(o, wanted=o["id"] in self.wanted) for o in sorted(self.offers.values(), key=lambda o: o["name"])
+                  if t - o["t"] < 15 and o["id"] not in here]
+        out = {"computers": comps, "events": self.events[-8:], "version": self.version, "now": t, "offers": offers,
+               "wanted": sorted(self.wanted)}
         if j:
             n = {"todo": 0, "busy": 0, "done": 0, "failed": 0}
             failed, unverified, err = [], 0, None
@@ -3540,6 +3569,8 @@ _ADDR_FILE = os.path.join(_ROOT, "host-addr.json")
 _FO = {"watch": 15.0, "after": 60.0, "stale": 50.0, "step": 20.0, "claim": 120.0, "holdoff": 20, "back": 15.0}
 
 _A = {"addr": None, "snap": None, "reply": None, "err": None, "procs": {}, "seq": {}, "resolve": {},
+      "auto": {"offers": {}, "since": {}, "plan": None, "with": None, "t": 0.0, "lost": None},
+      "packed": {}, "pack": None,
       "layout": {}, "msg": None, "coord_t": 0.0, "coord_err": None, "thread": None, "quit": threading.Event(),
       "sync": None, "use_v": {}, "drawn": None, "last_draw": 0.0, "running_job": None, "ip": (0.0, None), "cid": None,
       "owner": None, "verified": {}, "refused": None, "pre_id": None, "pre_result": None, "saving": False,
@@ -3977,6 +4008,150 @@ def _net_loop():
         _A["quit"].wait(1.0)
 
 
+# ---- hosts pick computers: a helper stays available to its saved hosts and joins the one that wants it ----
+AUTO_EVERY = 4.0        # how often a free computer tells its saved hosts it is there
+AUTO_GAP = 15.0         # the least time between two moves from one host to another
+AUTO_LOST = 300.0       # a host that went quiet mid-render keeps this computer this long (it may come back)
+
+
+def _addr_for(address, port):
+    a = (address or "").strip().replace("http://", "").rstrip("/")
+    if not a:
+        return None
+    return a if a.count(":") == 1 else "%s:%d" % (a, port)
+
+
+def _offer_loop():
+    """Network thread: tell every saved host (other than the one joined) that this computer is there."""
+    while not _A["quit"].is_set():
+        plan = _A["auto"].get("plan")
+        if plan:
+            def one(addr, extra):
+                try:
+                    r = rpc(addr, dict({"op": "offer", "computer": plan["computer"]}, **extra), timeout=4.0)
+                    _A["auto"]["offers"][addr] = {"t": time.time(), "want": bool(r.get("want")),
+                                                  "running": bool(r.get("running")), "name": r.get("name"),
+                                                  "error": r.get("error")}
+                except (OSError, ValueError):
+                    _A["auto"]["offers"][addr] = {"t": time.time(), "want": False, "running": False,
+                                                  "name": None, "error": "offline"}
+            ths = [threading.Thread(target=one, args=(a, x), daemon=True) for a, x in plan["targets"].items()]
+            for th in ths:
+                th.start()
+            for th in ths:
+                th.join(6.0)
+        _A["quit"].wait(AUTO_EVERY)
+
+
+def _auto_tick(prefs):
+    """Decide which saved host this computer helps. A host's render that is running keeps it; otherwise the
+    host that picked it first and is rendering gets it, then the host that picked it first."""
+    A = _A["auto"]
+    if prefs.mode != "JOIN" or not prefs.auto_join or not len(prefs.hosts):
+        A["plan"] = None
+        return
+    t = time.time()
+    saved = {}
+    for h in prefs.hosts:
+        a = _addr_for(h.address, prefs.port)
+        if a:
+            saved[a] = h
+    cur = _join_addr(prefs) if prefs.joined else None
+    fresh = {a: o for a, o in A["offers"].items() if a in saved and a != cur and t - o["t"] < 15 and not o.get("error")}
+    for a in list(A["since"]):
+        if a not in fresh or not fresh[a]["want"]:
+            A["since"].pop(a, None)
+    for a, o in fresh.items():
+        if o["want"]:
+            A["since"].setdefault(a, t)
+    queue = sorted(A["since"], key=A["since"].get)
+    r = _fresh_reply() if cur else None
+    cur_running = bool(r and (r.get("job") or {}).get("state") == "running")
+    cur_name = (saved[cur].name if cur in saved else prefs.host_address) if cur else None
+    if cur and r is None:                              # the host went quiet: was it rendering?
+        A["lost"] = A.get("lost") or t
+    else:
+        A["lost"] = None
+    if cur and r is not None:
+        A["was_running"] = cur_running
+    # what to tell each other saved host
+    state = "busy" if cur_running else ("free" if not cur else "idle")
+    targets = {}
+    for a in saved:
+        if a == cur:
+            continue
+        x = {"state": state, "with": cur_name}
+        if a in queue and state != "free":
+            x["place"] = queue.index(a) + 1
+        targets[a] = x
+    A["plan"] = {"computer": {"id": _computer_id(), "name": _computer_name(), "addon": VERSION, "protocol": PROTOCOL,
+                              "cards": [g.name for g in prefs.gpus if g.use]}, "targets": targets}
+    if t - A["t"] < AUTO_GAP:
+        return
+    rendering = [a for a in queue if fresh[a]["running"]]
+    target = cur
+    if cur and cur_running:
+        target = cur                                    # never leave a render that is running
+    elif cur and r is None and A.get("was_running") and t - (A["lost"] or t) < AUTO_LOST:
+        target = cur                                    # its host may be back in a moment (or another takes over)
+    elif rendering:
+        target = rendering[0]
+    elif cur and (r is None or r.get("wanted") or A.get("with") != cur):
+        target = cur                                    # still wanted, joined by hand, or unreachable: stay
+    elif queue:
+        target = queue[0]
+    elif cur and A.get("with") == cur and r is not None and not r.get("wanted"):
+        target = None                                   # the host let it go: free for the others
+    if target == cur:
+        return
+    A["t"] = t
+    for p in _A["procs"].values():                      # cards of the last host's render
+        if not p.get("dead"):
+            _kill(p["pid"])
+            p["killed"] = t
+    if target is None:
+        prefs.joined = False
+        A["with"] = None
+        _A["msg"] = "%s doesn't need this computer any more: it's free for your other hosts" % cur_name
+    else:
+        h = saved[target]
+        prefs.host_address = h.address
+        prefs.joined = True
+        A["with"] = target
+        A["since"].pop(target, None)
+        refresh_cards(prefs)
+        _A["msg"] = "%s picked this computer: helping it now" % (h.name or h.address)
+    _mark_dirty()
+
+
+def _auto_lines(prefs):
+    """For the Join panel: what each saved host wants from this computer."""
+    A = _A["auto"]
+    t = time.time()
+    out = []
+    queue = sorted(A["since"], key=A["since"].get)
+    for h in prefs.hosts:
+        a = _addr_for(h.address, prefs.port)
+        o = A["offers"].get(a)
+        if a == (_join_addr(prefs) if prefs.joined else None):
+            continue
+        if not o or t - o["t"] > 15:
+            txt = "..."
+        elif o.get("error"):
+            txt = "offline" if o["error"] == "offline" else o["error"][:60]
+        elif o["want"]:
+            n = queue.index(a) + 1 if a in queue else 1
+            txt = "wants this computer%s (%s in line)" % (", rendering" if o["running"] else "", _nth(n))
+        else:
+            txt = "rendering" if o["running"] else "on"
+        out.append((h.name or h.address, txt))
+    return out
+
+
+def _nth(n):
+    return {1: "next", 2: "2nd", 3: "3rd"}.get(n, "%dth" % n)
+
+
 def _fetch_replica(addr, comp, job):
     """A computer that has joined keeps a copy of the host's render, so it can carry it on as host itself
     if the host stops answering. Runs in the network thread."""
@@ -4016,6 +4191,8 @@ def _snapshot(prefs, owner=True):
     job = (_A.get("reply") or {}).get("job")
     res = None
     a = _addresses()
+    if base["is_host"]:
+        base["wanted"] = [[x.cid, x.name] for x in prefs.peers if x.cid]
     base.update(port=prefs.port, addrs=[x for x in (a["lan"], a.get("tailscale")) if x],
                 failover=bool(prefs.mode == "JOIN" and prefs.joined and prefs.auto_takeover and not _away_now()))
     if job:
@@ -4818,10 +4995,23 @@ def _sync_tick():
 
             threading.Thread(target=notify, daemon=True).start()
         return
-    if not _same_file(bpy.data.filepath, s["blend"]):
+    pk = s.get("packing")
+    if pk is not None:                               # saved already: compressing it for the other computers
+        if not pk["finished"]:
+            return
+        _A["pack"] = None
+        if pk.get("err"):
+            print("MultiGPU:", _pack_note(pk))
+        err, give_up = None, False
+    elif not _same_file(bpy.data.filepath, s["blend"]):
         err, give_up = "this Blender now has a different file open than the one being rendered", True
     else:
         err, give_up = _save_now(s["token"], s["scene"]), t - s["t0"] > 40
+        p = _prefs()
+        if err is None and p is not None and p.compress_blend and _pack_needed(s["blend"]):
+            s["packing"] = _pack_start(s["blend"], "sync")
+            _A["msg"] = "Changes saved. Compressing the project for the other computers..."
+            return
     if err is None:
         more = {}
         p = _prefs()
@@ -4845,6 +5035,183 @@ def _sync_tick():
         s["next"] = t + 1.5
 
 
+# ---- the smallest .blend Blender still opens ---------------------------------------------
+# Blender reads .blend files compressed with zstd in "seekable" form: independent frames and a table of them at
+# the end. Its own Compress option uses a fast setting and small frames. The same form at the strongest setting
+# and with 16 MB frames is about a fifth smaller again, and opens just as fast (zstd unpacks equally fast at
+# every setting).
+PACK_LEVEL = 19
+PACK_FRAME = 16 << 20
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _seek_table(path):
+    """[(packed size, size), ...] of a seekable zstd file, or None."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != ZSTD_MAGIC:
+                return None
+            f.seek(-9, 2)
+            n, desc, magic = struct.unpack("<IBI", f.read(9))
+            if magic != 0x8F92EAB1 or n > 1 << 20:
+                return None
+            ent = 12 if desc & 0x80 else 8
+            f.seek(-9 - n * ent, 2)
+            raw = f.read(n * ent)
+        return [struct.unpack_from("<II", raw, i * ent) for i in range(n)]
+    except (OSError, struct.error):
+        return None
+
+
+def _pack_needed(path):
+    try:
+        import zstandard  # noqa: F401  (bundled with Blender)
+        st = os.stat(path)
+    except (ImportError, OSError):
+        return False
+    if _A["packed"].get(path) == (st.st_size, st.st_mtime_ns):
+        return False
+    tab = _seek_table(path)
+    if tab and len(tab) > 1 and all(d == PACK_FRAME for _c, d in tab[:-1]):
+        _A["packed"][path] = (st.st_size, st.st_mtime_ns)
+        return False
+    return True
+
+
+def _pack_blend(path, job):
+    """Rewrite `path` in place at the strongest setting. Every frame is unpacked again and compared before the
+    file is swapped in, and nothing is swapped in if the .blend was saved again meanwhile. Runs in a thread."""
+    import zstandard as Z
+    from concurrent.futures import ThreadPoolExecutor
+    st0 = os.stat(path)
+    tab = _seek_table(path)
+    job["total"] = sum(d for _c, d in tab) if tab else st0.st_size
+    tmp = os.path.join(os.path.dirname(path), ".syncthing.%s.multigpu.tmp" % os.path.basename(path))
+    threads = max(1, min(32, (os.cpu_count() or 2) - 1))
+
+    def work(chunk):
+        c = Z.ZstdCompressor(level=PACK_LEVEL, write_checksum=True).compress(chunk)
+        if Z.ZstdDecompressor().decompress(c, max_output_size=len(chunk)) != chunk:
+            raise OSError("a compressed piece didn't unpack to the same data")
+        return c, len(chunk)
+    table = []
+    try:
+        with open(path, "rb") as fin:
+            rd = Z.ZstdDecompressor().stream_reader(fin, read_across_frames=True) if fin.read(4) == ZSTD_MAGIC else fin
+            fin.seek(0)
+            with open(tmp, "wb") as out, ThreadPoolExecutor(threads) as ex:
+                pending = []
+
+                def drain(n):
+                    while len(pending) > n:
+                        c, ln = pending.pop(0).result()
+                        out.write(c)
+                        table.append((len(c), ln))
+                        job["done"] += ln
+                while True:
+                    if job.get("abort"):
+                        raise OSError("the .blend was saved again")
+                    chunk = rd.read(PACK_FRAME)
+                    if not chunk:
+                        break
+                    pending.append(ex.submit(work, chunk))
+                    drain(threads + 2)
+                drain(0)
+                body = b"".join(struct.pack("<II", c, d) for c, d in table) + struct.pack("<IBI", len(table), 0, 0x8F92EAB1)
+                out.write(struct.pack("<II", 0x184D2A5E, len(body)) + body)
+                out.flush()
+                os.fsync(out.fileno())
+        if tab and sum(d for _c, d in tab) != sum(d for _c, d in table):
+            raise OSError("the unpacked size doesn't match")
+        if os.path.getsize(tmp) != sum(c for c, _d in table) + 8 + len(body):
+            raise OSError("the compressed file wasn't written completely")
+        try:
+            shutil.copymode(path, tmp)
+        except OSError:
+            pass
+        for i in range(20):                          # (a computer may still have the file open)
+            st1 = os.stat(path)
+            if job.get("abort") or (st1.st_size, st1.st_mtime_ns) != (st0.st_size, st0.st_mtime_ns):
+                raise OSError("the .blend was saved again")
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if i == 19:
+                    raise
+                time.sleep(1.0)
+        st2 = os.stat(path)
+        _A["packed"][path] = (st2.st_size, st2.st_mtime_ns)
+        job["before"], job["after"] = st0.st_size, st2.st_size
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _pack_start(path, then):
+    """Compress the .blend in the background; `then` ("render" or "sync") carries on when it is done."""
+    job = {"path": path, "then": then, "t0": time.time(), "done": 0, "total": 0, "err": None, "finished": False}
+
+    def run():
+        try:
+            _pack_blend(path, job)
+        except Exception as e:
+            job["err"] = getattr(e, "strerror", None) or str(e) or e.__class__.__name__
+            if not isinstance(e, OSError):
+                traceback.print_exc()
+        job["finished"] = True
+    _A["pack"] = job
+    threading.Thread(target=run, daemon=True).start()
+    if then == "render" and not bpy.app.timers.is_registered(_pack_poll):
+        bpy.app.timers.register(_pack_poll, first_interval=0.5)
+    return job
+
+
+def _pack_poll():
+    """Start the render once the project is compressed."""
+    job = _A.get("pack")
+    if not job or job.get("then") != "render":
+        return None
+    if not job["finished"]:
+        _redraw()
+        return 0.5
+    _A["pack"] = None
+    _A["msg"] = _pack_note(job)
+    wm = bpy.context.window_manager
+    win = wm.windows[0] if wm and wm.windows else None
+    try:
+        if win is not None:
+            with bpy.context.temp_override(window=win):
+                bpy.ops.multigpu.render('EXEC_DEFAULT', packed=True)
+        else:
+            bpy.ops.multigpu.render('EXEC_DEFAULT', packed=True)
+    except Exception as e:
+        _A["msg"] = "The render didn't start: %s" % e
+    return None
+
+
+def _pack_note(job):
+    if job.get("err"):
+        return "Couldn't compress the project further (%s): the other computers load it as saved" % job["err"]
+    if job.get("after"):
+        return "Project compressed: %s -> %s for the other computers" % (_mb(job["before"]), _mb(job["after"]))
+    return None
+
+
+def _mb(n):
+    return "%.1f GB" % (n / 1e9) if n >= 1e9 else "%.0f MB" % max(1, n / 1e6)
+
+
+def _pack_text():
+    job = _A.get("pack")
+    if not job or job["finished"]:
+        return None
+    pct = 100.0 * job["done"] / job["total"] if job.get("total") else 0.0
+    return "Compressing the project for the other computers: %d%%" % pct
+
+
 def _save_now(token, scene_name=None):
     """Save the .blend with a new version token in the scene being rendered. Returns an error or None."""
     sc = bpy.data.scenes.get(scene_name) if scene_name else bpy.context.scene
@@ -4858,11 +5225,13 @@ def _save_now(token, scene_name=None):
     try:
         wm = bpy.context.window_manager
         win = wm.windows[0] if wm and wm.windows else None
+        p = _prefs()
+        kw = {"compress": True} if p is not None and p.compress_blend else {}
         if win is not None:
             with bpy.context.temp_override(window=win):
-                result = bpy.ops.wm.save_mainfile()
+                result = bpy.ops.wm.save_mainfile(**kw)
         else:
-            result = bpy.ops.wm.save_mainfile()
+            result = bpy.ops.wm.save_mainfile(**kw)
         if 'FINISHED' not in result:
             raise RuntimeError("Blender cancelled saving the file")
         _A["token_unsaved"] = False
@@ -4968,6 +5337,9 @@ def _on_save_pre(*args):
         if mine and _A.get("running_job") == mine["id"] and (not job or job.get("id") != mine["id"]):
             job = mine
         target = args[0] if args and isinstance(args[0], str) else bpy.data.filepath
+        pk = _A.get("pack")
+        if pk and not pk["finished"] and _same_file(pk["path"], target):
+            pk["abort"] = True                       # a newer save: the one being compressed is out of date
         if job and job.get("state") == "running" and job.get("host") != _computer_id() and not _origin_here(job):
             _keep_render_file(target, job)
             return
@@ -5030,6 +5402,8 @@ def _agent_tick():
         elif not owner and _A["owner"]:
             _A["procs"] = {}                            # another Blender on this computer took over
         _A["owner"] = owner
+        if owner:
+            _auto_tick(prefs)
         _fo_apply(prefs)
         if owner and not _A["boot_done"]:
             _fo_tick(prefs, owner, _A["addr"])          # (before a new host process replaces the saved state)
@@ -5201,10 +5575,22 @@ class MULTIGPU_Host(bpy.types.PropertyGroup):
     address: StringProperty(name="Address")
 
 
+class MULTIGPU_Peer(bpy.types.PropertyGroup):
+    """A computer this host picked: it joins by itself whenever it is free."""
+    cid: StringProperty()
+    name: StringProperty()
+
+
 class MULTIGPU_Prefs(bpy.types.AddonPreferences):
     bl_idname = __name__
     gpus: CollectionProperty(type=MULTIGPU_Device)
     hosts: CollectionProperty(type=MULTIGPU_Host)
+    peers: CollectionProperty(type=MULTIGPU_Peer)
+    auto_join: BoolProperty(
+        name="Let My Saved Hosts Pick This Computer", default=True,
+        description="Stay available to every host in the saved list. A host that wants this computer presses Use, "
+                    "and this computer joins it by itself, now and whenever Blender is open here. If two hosts want "
+                    "it, the second one gets it as soon as the first one's render is done")
     gpu_memory: StringProperty(default="", options={'HIDDEN'},
                                description="Ticks of cards that aren't connected right now")
     mode: EnumProperty(
@@ -5251,6 +5637,11 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
         name="Placeholders", default=True,
         description="Put a 0 KB file in place of each frame while it renders, so you can see which frames are "
                     "taken. Frames are handed out by the host either way, so none is ever rendered twice")
+    compress_blend: BoolProperty(
+        name="Smallest Project File", default=True,
+        description="Whenever MultiGPU saves the .blend (at the start of a render and with Sync Changes), compress it "
+                    "as far as Blender can still open it: smaller than Blender's own Compress option, so every "
+                    "computer loads it faster over the network. It takes a few seconds per 100 MB, in the background")
     smart_finish: BoolProperty(
         name="Smart Finish", default=True,
         description="Give the last frames to the cards that finish them soonest. A slow card doesn't start a "
@@ -5650,11 +6041,16 @@ class MULTIGPU_OT_render(bpy.types.Operator):
         col.separator()
         col.label(text="Render anyway?")
 
+    packed: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+
     def execute(self, context):
         prefs = _prefs(context)
         err = _basic_checks(context, prefs)
         if err:
             self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        if _A.get("pack") and not _A["pack"]["finished"]:
+            self.report({'INFO'}, "Still compressing the project. The render starts by itself when that's done")
             return {'CANCELLED'}
         sc, rd = context.scene, context.scene.render
         if not _A.get("owner"):                        # this Blender now looks after this computer's cards
@@ -5670,7 +6066,7 @@ class MULTIGPU_OT_render(bpy.types.Operator):
             if not p.get("dead") and not p.get("killed"):
                 _kill(p["pid"])
                 p["killed"] = time.time()
-        if not sc.get(TOKEN) or _A.get("token_unsaved") or (prefs.save_first and bpy.data.is_dirty):
+        if not self.packed and (not sc.get(TOKEN) or _A.get("token_unsaved") or (prefs.save_first and bpy.data.is_dirty)):
             err = None
             for i in range(3):
                 err = _save_now(uuid.uuid4().hex, sc.name)
@@ -5680,6 +6076,11 @@ class MULTIGPU_OT_render(bpy.types.Operator):
             if err:
                 self.report({'ERROR'}, "Couldn't save the file: %s" % err)
                 return {'CANCELLED'}
+        if prefs.compress_blend and not self.packed and _pack_needed(bpy.data.filepath):
+            _pack_start(bpy.data.filepath, "render")
+            self.report({'INFO'}, "Compressing the project for the other computers. The render starts when that's done")
+            _redraw()
+            return {'FINISHED'}
         frames, paths = _job_frames(sc)
         sets = {}
         files, host_missing = _external_files(sets)
@@ -5879,6 +6280,8 @@ class MULTIGPU_OT_join(bpy.types.Operator):
         prefs = _prefs(context)
         if self.leave:
             prefs.joined = False
+            prefs.auto_join = False                     # left on purpose: no host pulls it back in
+            _A["auto"]["with"] = None
             _mark_dirty()
             t = time.time()
             for p in _A["procs"].values():
@@ -5911,6 +6314,27 @@ class MULTIGPU_OT_join(bpy.types.Operator):
         refresh_cards(prefs)
         _mark_dirty()
         self.report({'INFO'}, "Joined %s%s" % (saved.name, ". It's rendering: this computer joins in" if r.get("running") else ""))
+        return {'FINISHED'}
+
+
+class MULTIGPU_OT_peer_use(bpy.types.Operator):
+    bl_idname = "multigpu.peer_use"
+    bl_label = "Use This Computer"
+    bl_description = ("Have this computer help this host. It joins by itself whenever it is free, also later. "
+                      "If it is helping another host, it comes as soon as that render is done")
+    cid: StringProperty()
+    name: StringProperty()
+    use: BoolProperty(default=True)
+
+    def execute(self, context):
+        prefs = _prefs(context)
+        for i in range(len(prefs.peers) - 1, -1, -1):
+            if prefs.peers[i].cid == self.cid:
+                prefs.peers.remove(i)
+        if self.use:
+            x = prefs.peers.add()
+            x.cid, x.name = self.cid, self.name
+        _mark_dirty()
         return {'FINISHED'}
 
 
@@ -6099,18 +6523,46 @@ def draw_ui(layout, context, prefs_only=False):
             w.label(text="Windows Firewall blocks Blender: other computers can't connect", icon='ERROR')
             w.operator("multigpu.firewall", text="Copy Fix (paste into PowerShell as administrator)", icon='COPYDOWN')
         others = [c for c in (st or {}).get("computers", []) if not c.get("host")]
+        picked = set(x.cid for x in prefs.peers)
+        offers = (st or {}).get("offers") or []
         if not running:
-            if not others:
+            if not others and not offers:
                 info.label(text="No other computer has joined yet")
             for c in others:
-                info.label(text="%s  |  %s" % (c["name"], "connected" if c["online"] else "offline"),
-                           icon='DESKTOP' if c["online"] else 'ERROR')
+                hr = info.row(align=True)
+                hr.label(text="%s  |  %s" % (c["name"], "connected" if c["online"] else "offline"),
+                         icon='DESKTOP' if c["online"] else 'ERROR')
+                if c["id"] in picked:
+                    op = hr.operator("multigpu.peer_use", text="", icon='X', emboss=False)
+                    op.cid, op.name, op.use = c["id"], c["name"], False
                 for x in c["cards"]:
                     rr = info.row(align=True)
                     rr.enabled = c["online"]
                     op = rr.operator("multigpu.card_use", text="%s (%s)" % (x["label"], _LABEL.get(x["backend"], x["backend"])),
                                      icon='CHECKBOX_HLT' if x.get("use") else 'CHECKBOX_DEHLT', emboss=False)
                     op.card, op.use = x["id"], not x.get("use")
+        if offers:
+            info.separator()
+            info.label(text="Can help this computer:")
+        for o in offers:
+            rr = info.row(align=True)
+            n = len(o.get("cards") or [])
+            rr.label(text="%s  (%d card%s)" % (o["name"], n, "" if n == 1 else "s"), icon='DESKTOP')
+            if o.get("wanted"):
+                if o.get("state") == "busy":
+                    msg = "comes after %s's render (%s in line)" % (o.get("with") or "another host", _nth(o.get("place") or 1))
+                elif o.get("state") == "idle":
+                    msg = "with %s; comes when you render" % (o.get("with") or "another host")
+                else:
+                    msg = "joining..."
+                rr.label(text=msg)
+                op = rr.operator("multigpu.peer_use", text="", icon='X', emboss=False)
+                op.cid, op.name, op.use = o["id"], o["name"], False
+            else:
+                if o.get("state") == "busy":
+                    rr.label(text="busy with %s" % (o.get("with") or "another host"))
+                op = rr.operator("multigpu.peer_use", text="Use", icon='ADD')
+                op.cid, op.name, op.use = o["id"], o["name"], True
         if prefs_only:
             box.prop(prefs, "port")
     elif prefs.mode == "JOIN":
@@ -6145,6 +6597,17 @@ def draw_ui(layout, context, prefs_only=False):
                     op = rr.operator("multigpu.join", text="Join", icon='LINKED')
                     op.leave, op.index = False, i
                     rr.operator("multigpu.host_remove", text="", icon='X').index = i
+        if len(prefs.hosts):
+            box.prop(prefs, "auto_join")
+            if prefs.auto_join:
+                lines = _auto_lines(prefs)
+                if lines:
+                    al = box.column(align=True)
+                    al.scale_y = 0.8
+                    for name, txt in lines:
+                        al.label(text="%s:  %s" % (name, txt), icon='BLANK1')
+                if not prefs.joined:
+                    box.label(text="Waiting for a host to pick this computer (Use, on the host)", icon='TIME')
         folder = box.column(align=True)
         folder.enabled = not running
         folder.prop(prefs, "shared_roots")
@@ -6211,7 +6674,9 @@ def draw_ui(layout, context, prefs_only=False):
             col.label(text=text)
         info = col.row()
         info.scale_y = 0.8
-        if (_A.get("sync") or {}).get("payload") is not None:
+        if _pack_text():
+            info.label(text=_pack_text(), icon='FILE_REFRESH')
+        elif (_A.get("sync") or {}).get("payload") is not None:
             info.label(text="Changes saved; waiting for the host...", icon='FILE_REFRESH')
         elif job.get("sync_pending") or _A.get("sync"):
             info.label(text="Saving your changes...", icon='FILE_REFRESH')
@@ -6255,9 +6720,11 @@ def draw_ui(layout, context, prefs_only=False):
         n = sum(1 for g in prefs.gpus if g.use)
         n += sum(len([x for x in c["cards"] if x.get("use")]) for c in (st or {}).get("computers", [])
                  if c["online"] and not c.get("host") and c["id"] != _computer_id())
+        if _pack_text():
+            col.label(text=_pack_text() + ". The render starts after", icon='FILE_REFRESH')
         r = col.row(align=True)
         r.scale_y = 2.2
-        r.enabled = n > 0 and bool(bpy.data.filepath)
+        r.enabled = n > 0 and bool(bpy.data.filepath) and not _pack_text()
         r.operator("multigpu.render", text="Render on %d card%s" % (n, "" if n == 1 else "s"), icon='RENDER_ANIMATION')
         r.operator("multigpu.open_folder", text="", icon='FILE_FOLDER')
     if job and _A.get("dismissed") != job["id"]:
@@ -6316,6 +6783,7 @@ def _draw_advanced(box, prefs, running, sc=None):
     r.prop(prefs, "save_first")
     adv.prop(prefs, "copy_missing")
     adv.prop(prefs, "smart_finish")
+    adv.prop(prefs, "compress_blend")
     if sc is not None:                                # Blender's own Post Processing settings of this scene
         adv.separator()
         adv.label(text="Post Processing (all cards use it)")
@@ -6451,9 +6919,12 @@ def start_agent():
     if not (_A["fo_thread"] and _A["fo_thread"].is_alive()):
         _A["fo_thread"] = threading.Thread(target=_fo_loop, daemon=True)
         _A["fo_thread"].start()
+    if not (_A.get("offer_thread") and _A["offer_thread"].is_alive()):
+        _A["offer_thread"] = threading.Thread(target=_offer_loop, daemon=True)
+        _A["offer_thread"].start()
 
 
-classes = (MULTIGPU_Device, MULTIGPU_Host, MULTIGPU_Prefs, MULTIGPU_OT_detect, MULTIGPU_OT_render, MULTIGPU_OT_sync,
+classes = (MULTIGPU_Device, MULTIGPU_Host, MULTIGPU_Peer, MULTIGPU_Prefs, MULTIGPU_OT_peer_use, MULTIGPU_OT_detect, MULTIGPU_OT_render, MULTIGPU_OT_sync,
            MULTIGPU_OT_card_stop, MULTIGPU_OT_card_use, MULTIGPU_OT_card_resume, MULTIGPU_OT_stop, MULTIGPU_OT_join,
            MULTIGPU_OT_host_remove, MULTIGPU_OT_folder, MULTIGPU_OT_relative, MULTIGPU_OT_firewall, MULTIGPU_OT_clear,
            MULTIGPU_PT_output, MULTIGPU_PT_sidebar)

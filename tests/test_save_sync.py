@@ -20,7 +20,7 @@ class SaveTests(unittest.TestCase):
                     context=types.SimpleNamespace(window_manager=None),
                     ops=types.SimpleNamespace(wm=types.SimpleNamespace(save_mainfile=lambda: {'CANCELLED'})))
                 ns = functions(SOURCE.read_text(encoding="utf-8"), ["_save_now"],
-                               dict(bpy=bpy, TOKEN="token", _TEST={}, _A={"token_unsaved": True}))
+                               dict(bpy=bpy, TOKEN="token", _TEST={}, _A={"token_unsaved": True}, _prefs=lambda: None))
                 self.assertIn("cancelled", ns["_save_now"]("new-token", "Scene"))
                 self.assertEqual(scene.get("token"), old)
                 self.assertFalse(ns["_A"]["saving"])
