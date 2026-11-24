@@ -70,6 +70,10 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   computer's own Blender.
 - **Broken links are named before the render:** a file that the host itself can't find can't be
   sent, so the check before the render lists it by name.
+- **Interrupted asset copies resume:** completed chunks stay in the receiving computer's temporary
+  folder across retries and worker restarts. Transfers retry connection failures and adjust chunk
+  sizes for slower links. The card's status shows the file and megabytes copied. A changed source
+  file starts a fresh copy; an incomplete copy never becomes the file used for rendering.
 - **Smart Finish** (on by default): the last frames go to the cards that finish them soonest.
   A slow card doesn't start a frame that the faster cards would have finished before it, and a
   fast card with nothing left to do also renders a frame a slow card still needs long for; the
