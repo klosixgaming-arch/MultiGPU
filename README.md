@@ -80,6 +80,20 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   **Take Over if the Host Stops** on a joined computer.
 - **Sync Changes:** saving the .blend (Ctrl+S) doesn't change what's rendering. **Sync Changes**
   saves the file and has each card reload it after its current frame.
+  If the connection drops after saving, MultiGPU retries notifying the host automatically,
+  without saving again or blocking the interface on the acknowledgement.
+
+## Where your files go
+
+- **The .blend:** save your project before rendering. **Save First** includes unsaved edits when
+  starting a render; use **Sync Changes** to apply edits during an active render.
+- **Rendered frames:** set **Frame output** in the MultiGPU panel. A path such as `//renders/`
+  creates a renders folder beside the .blend. **Follow the .blend** converts an existing full path
+  to a relative path while keeping the same destination.
+- **Missing textures and other assets:** **Copy Missing Files** caches these in the receiving
+  computer's temporary folder. It doesn't transfer the main .blend or bring rendered frames back.
+- **A computer on a slow connection:** use a local synced project folder as described below.
+  A sync program must carry both the .blend and finished frames between the computers.
 
 ## A computer far away (Syncthing, Dropbox ...)
 
@@ -87,8 +101,9 @@ A friend's computer in another city shouldn't read the scene and save its frames
 connection. Give it its own copy of the project folder, kept in step by a sync program, and
 MultiGPU works from that copy:
 
-1. On that computer, open **Preferences › Add-ons › MultiGPU** and set **Project Folder on This
+1. On that computer, set **Network › Join**, then set **Project Folder on This
    Computer** to its own copy of the project (the folder the sync program fills).
+   This setting is also available in **Preferences › Add-ons › MultiGPU**.
 2. Join the host as usual (over Tailscale, for example).
 
 MultiGPU notices by itself that the computer doesn't see the host's folder directly. That computer

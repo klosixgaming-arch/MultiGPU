@@ -1879,6 +1879,10 @@ class Coordinator(object):
             j = self.job
             if not j:
                 return {"error": "nothing is rendering"}
+            if req.get("job") is not None and req["job"] != j["id"]:
+                return {"error": "the render changed while saving"}
+            if req.get("token") == j["blend"].get("token"):
+                return {"ok": True}               # a lost acknowledgement can safely be retried
             j["blend"]["token"] = req.get("token")
             j["blend"]["size"] = req.get("size")
             if isinstance(req.get("files"), list):         # the saved scene may use other files now
@@ -1889,6 +1893,7 @@ class Coordinator(object):
             j["sync_pending"] = False
             j["unsynced"] = False
             j["synced_at"] = now()
+            self.dirty = True
             self.event("Changes synced; each card reloads after its frame")
             return {"ok": True}
 
@@ -4657,33 +4662,53 @@ def _reconcile(prefs, r):
 
 
 def _sync_tick():
-    """Sync Changes: keep trying to save until no card is holding the file open."""
+    """Save once, then retry notifying the host off the UI thread until it acknowledges."""
     s = _A.get("sync")
     if not s:
         return
     t = time.time()
     if t < s["next"]:
         return
+    if s.get("payload") is not None:
+        reply = s.pop("reply", None)
+        if reply is not None:
+            r, error = reply
+            s.pop("notifying", None)
+            if error is not None:
+                s["next"] = t + 2
+                _A["msg"] = "Changes saved. Waiting to reach the host; retrying automatically: %s" % error
+                return
+            _A["sync"] = None
+            _A["msg"] = ("Saved, but couldn't sync: %s" % r["error"]) if r.get("error") else \
+                "Changes saved. Each card picks them up after its current frame"
+            return
+        if not s.get("notifying"):
+            s["notifying"] = True
+
+            def notify():
+                try:
+                    s["reply"] = (rpc(s["addr"], s["payload"]), None)
+                except OSError as e:
+                    s["reply"] = (None, str(e))
+
+            threading.Thread(target=notify, daemon=True).start()
+        return
     if not _same_file(bpy.data.filepath, s["blend"]):
         err, give_up = "this Blender now has a different file open than the one being rendered", True
     else:
         err, give_up = _save_now(s["token"], s["scene"]), t - s["t0"] > 40
     if err is None:
-        _A["sync"] = None
-        try:
-            more = {}
-            p = _prefs()
-            if p is not None and p.copy_missing:
-                try:
-                    sets = {}
-                    more = {"files": sorted(_sendable(_external_files(sets)[0])), "sets": sets}
-                except Exception:
-                    traceback.print_exc()
-            rpc(s["addr"], dict({"op": "sync_end", "token": s["token"], "size": os.path.getsize(bpy.data.filepath),
-                                 "computer": _computer_id()}, **more))
-            _A["msg"] = "Changes saved. Each card picks them up after its current frame"
-        except OSError as e:
-            _A["msg"] = "Saved, but couldn't tell the host: %s" % e
+        more = {}
+        p = _prefs()
+        if p is not None and p.copy_missing:
+            try:
+                sets = {}
+                more = {"files": sorted(_sendable(_external_files(sets)[0])), "sets": sets}
+            except Exception:
+                traceback.print_exc()
+        s["payload"] = dict({"op": "sync_end", "token": s["token"], "size": os.path.getsize(s["blend"]),
+                             "job": s["job"], "computer": _computer_id()}, **more)
+        _A["msg"] = "Changes saved. Notifying the host..."
     elif give_up:
         _A["sync"] = None
         try:
@@ -4710,9 +4735,11 @@ def _save_now(token, scene_name=None):
         win = wm.windows[0] if wm and wm.windows else None
         if win is not None:
             with bpy.context.temp_override(window=win):
-                bpy.ops.wm.save_mainfile()
+                result = bpy.ops.wm.save_mainfile()
         else:
-            bpy.ops.wm.save_mainfile()
+            result = bpy.ops.wm.save_mainfile()
+        if 'FINISHED' not in result:
+            raise RuntimeError("Blender cancelled saving the file")
         _A["token_unsaved"] = False
         return None
     except RuntimeError as e:
@@ -5522,11 +5549,12 @@ class MULTIGPU_OT_sync(bpy.types.Operator):
                 p["killed"] = t
                 p["relaunch"] = True
         _A["sync"] = {"t0": t, "next": t, "token": uuid.uuid4().hex, "scene": job["scene"], "blend": blend,
-                      "addr": addr}
+                      "addr": addr, "job": job["id"]}
         _A["unsynced_send"] = False
+        _A["msg"] = "Waiting for the cards to let go of the file..."
         _sync_tick()
         if _A.get("sync"):
-            self.report({'INFO'}, "Waiting for the cards to let go of the file...")
+            self.report({'INFO'}, _A.get("msg") or "Waiting for the cards to let go of the file...")
         else:
             self.report({'INFO'}, _A.get("msg") or "Changes saved")
         return {'FINISHED'}
@@ -5894,9 +5922,12 @@ def draw_ui(layout, context, prefs_only=False):
                     op = rr.operator("multigpu.join", text="Join", icon='LINKED')
                     op.leave, op.index = False, i
                     rr.operator("multigpu.host_remove", text="", icon='X').index = i
+        folder = box.column(align=True)
+        folder.enabled = not running
+        folder.prop(prefs, "shared_roots")
+        folder.label(text="Slow connection? Use a local synced project folder", icon='FILE_FOLDER')
         if prefs_only:
             box.prop(prefs, "port")
-            box.prop(prefs, "shared_roots")
     if _is_host_mode(prefs) and _A["fo"].get("msg"):
         _alert(box, _A["fo"]["msg"])
     if _is_host_mode(prefs) and _A.get("coord_err"):
@@ -5933,6 +5964,7 @@ def draw_ui(layout, context, prefs_only=False):
         if not bpy.data.filepath:
             notes.label(text="Save the .blend file first", icon='ERROR')
         else:
+            notes.prop(rd, "filepath", text="Frame output")
             notes.label(text="Frames save in  %s" % _short_dir(sc), icon='FILE_FOLDER')
             if prefs.mode == "HOST" and rd.filepath and not rd.filepath.startswith("//"):
                 rr = notes.row()
@@ -5956,7 +5988,9 @@ def draw_ui(layout, context, prefs_only=False):
             col.label(text=text)
         info = col.row()
         info.scale_y = 0.8
-        if job.get("sync_pending") or _A.get("sync"):
+        if (_A.get("sync") or {}).get("payload") is not None:
+            info.label(text="Changes saved; waiting for the host...", icon='FILE_REFRESH')
+        elif job.get("sync_pending") or _A.get("sync"):
             info.label(text="Saving your changes...", icon='FILE_REFRESH')
         elif job.get("eta"):
             info.label(text="%s left  |  done around %s" % (_fmt(job["eta"]), _clock(time.time() + job["eta"])),
