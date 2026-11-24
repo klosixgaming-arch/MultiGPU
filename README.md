@@ -5,13 +5,13 @@ once. One computer (the host) hands out the frames one at a time over your netwo
 is ever rendered twice, a faster card simply takes more frames, and a card that crashes has its
 frame handed to another.
 
-**Version 2.5.3** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
+**Version 2.6.0** · Blender 4.2 or newer (tested on 5.2 and 5.3) · Cycles · Windows, Linux, macOS (Intel and ARM)
 
 ## Install
 
 **Drag into Blender:** drag this link onto an open Blender window and confirm:
 
-### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.5.3.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
+### [⬇ MultiGPU — drag me into Blender](https://raw.githubusercontent.com/klosixgaming-arch/MultiGPU/main/dist/multigpu-2.6.0.zip?repository=.%2Findex.json&blender_version_min=4.2.0)
 
 Blender asks once to add this page as a repository; say yes and it will also offer updates under
 **Edit › Preferences › Get Extensions**. This needs **Allow Online Access** switched on
@@ -80,6 +80,26 @@ relative to the .blend, such as `//../renders/`, is the simplest.
   **Take Over if the Host Stops** on a joined computer.
 - **Sync Changes:** saving the .blend (Ctrl+S) doesn't change what's rendering. **Sync Changes**
   saves the file and has each card reload it after its current frame.
+
+## A computer far away (Syncthing, Dropbox ...)
+
+A friend's computer in another city shouldn't read the scene and save its frames through a slow
+connection. Give it its own copy of the project folder, kept in step by a sync program, and
+MultiGPU works from that copy:
+
+1. On that computer, open **Preferences › Add-ons › MultiGPU** and set **Project Folder on This
+   Computer** to its own copy of the project (the folder the sync program fills).
+2. Join the host as usual (over Tailscale, for example).
+
+MultiGPU notices by itself that the computer doesn't see the host's folder directly. That computer
+then loads the scene from its own copy, renders into its own copy, and the sync program carries
+the frames to everyone. The host still hands out every frame exactly once. It shows how many
+frames are still on their way, and frames a computer already holds are not rendered again when
+you press Render a second time.
+
+- A computer working from its own copy never takes over as host.
+- If its copy of the .blend isn't up to date yet, it waits until the sync program has brought it.
+- Tip: add `.multigpu*` to the sync program's ignore list, so the hidden working files don't travel.
 
 ## Network security
 

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiGPU",
     "author": "klosixgaming-arch",
-    "version": (2, 5, 3),
+    "version": (2, 6, 0),
     "blender": (4, 2, 0),
     "location": "Properties > Output > MultiGPU  |  3D Viewport > Sidebar > MultiGPU",
     "description": "Render an animation on every graphics card of one or more computers on your network. "
@@ -91,7 +91,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 
-VERSION = "2.5.3"
+VERSION = "2.6.0"
 DEFAULT_PORT = 47800
 TOKEN = "_multigpu_token"
 _BACKENDS = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
@@ -113,6 +113,26 @@ def device_base(dev_id):
     """A Cycles device id without its address: the same for one card wherever it is plugged in."""
     d = dev_id[:-len("_OptiX")] if dev_id.endswith("_OptiX") else dev_id
     return d.rsplit("_", 1)[0] if "_" in d else d
+
+
+def pattern_name(pat, f):
+    """The file name of frame f, from the way the render names its frames."""
+    return pat["head"] + str(f).zfill(pat["pad"]) + pat["tail"]
+
+
+def to_ranges(frames):
+    """[1, 2, 3, 7, 8] -> [[1, 3], [7, 8]]"""
+    out = []
+    for f in sorted(frames):
+        if out and f == out[-1][1] + 1:
+            out[-1][1] = f
+        else:
+            out.append([f, f])
+    return out
+
+
+def from_ranges(ranges):
+    return [f for a, b in ranges or [] for f in range(a, b + 1)]
 
 
 FILE_CHUNK = 1 << 20           # files only the host has are sent to the other computers in pieces of this size
@@ -423,11 +443,23 @@ def find_blend(host_path, size, extra=""):
             return 2 if (not size or os.path.getsize(p) == size) else 1
         except OSError:
             return 0
+    _, parts = split_any(host_path)
+    other = None
+    mine = [r.strip().strip('"') for r in (extra or "").replace("\n", ";").split(";") if r.strip().strip('"')]
+    for k in range(len(parts), 1, -1):              # folders set on this computer come first: its own copy,
+        tail = parts[-k:]                           # kept in step by a sync program, beats a far-away original
+        for r in mine:
+            cand = os.path.join(r, *tail)
+            got = look(cand)
+            if got == 2 and split_any(cand) != split_any(host_path):
+                return cand, strip_tail(host_path, k), r
+            if got == 1 and other is None:
+                other = cand
+    if other:
+        raise LookupError("found %s, but it isn't the same version as the host's yet" % other)
     if look(host_path) == 2:
         return host_path, "", ""
-    _, parts = split_any(host_path)
     roots = candidate_roots(extra, host_path)
-    other = None
     for k in range(len(parts), 1, -1):
         tail = parts[-k:]
         for r in roots:
@@ -865,6 +897,7 @@ import base64, heapq, threading, traceback, socket, uuid, zlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 LEASE = 90          # seconds without any sign of life before a card's frame goes to another card
+LEASE_AWAY = 600    # the same for a computer with its own copy of the folder: its frame would be saved twice
 VERIFY_GRACE = 150  # seconds a finished frame may take to show up in the host's output folder
 HANG_MIN = 600      # a frame must have taken at least this long before an idle card also tries it
 HOLD_MARGIN = 0.9   # a slow card leaves the last frames alone only if the others finish them clearly sooner
@@ -914,6 +947,8 @@ class Coordinator(object):
         self.cleanup = []
         self.server = None
         self.resumed_at = 0.0
+        self.probes = []
+        self.arrive_t = 0.0
         self.pre = None
         self.awake = Awake()
         self.no_live = None
@@ -1145,6 +1180,8 @@ class Coordinator(object):
             h = self.cards.get(st.get("card") or "")
             if h is None or (b is not None and b.get("frame") == f):
                 continue
+            if self.away(h.get("computer")) or self.away(card.get("computer")):
+                continue                              # two folders: the frame would end up saved twice
             e = t - (st.get("t") or t)
             # what it still needs; with no pace known, or once it is over its usual time, how long it has been at it
             left = h["avg"] - e if h.get("avg") and e < h["avg"] else (e - h["avg"] if h.get("avg") else e)
@@ -1183,8 +1220,10 @@ class Coordinator(object):
         j["state"] = "finished"
         j["ended"] = now()
         nf = sum(1 for f in j["frames"] if self.fs(f)["s"] == "failed")
-        self.event("Finished: %d frames in %s%s" % (len(j["frames"]), _dur(j["ended"] - j["started"]),
-                                                   ", %d failed" % nf if nf else ""))
+        na = sum(1 for f in j["frames"] if self.fs(f).get("away"))
+        self.event("Finished: %d frames in %s%s%s" % (len(j["frames"]), _dur(j["ended"] - j["started"]),
+                                                     ", %d failed" % nf if nf else "",
+                                                     ". %d are still on their way to this computer's folder" % na if na else ""))
         for c in self.cards.values():
             c["frame"] = None
             if c.get("phase") in LIVE:
@@ -1310,6 +1349,57 @@ class Coordinator(object):
             return {"error": "the host can't read it (%s)" % (getattr(e, "strerror", None) or e)}
         return {"ok": True, "size": st.st_size, "mtime": st.st_mtime, "data": base64.b64encode(data).decode("ascii")}
 
+    # ---- computers that work from their own copy of the folder (kept in step by a sync program) ----
+    def away(self, comp_id):
+        """True when that computer doesn't see the host's output folder itself: it renders into its own copy,
+        and its frames reach the host's folder later."""
+        j = self.job
+        r = (self.computers.get(comp_id) or {}).get("resolve") or {}
+        return bool(j and r.get("job") == j["id"] and r.get("away"))
+
+    def mark_have(self, comp_id, frames):
+        """Frames that computer already has in its own copy: they aren't rendered again."""
+        j = self.job
+        if not j or j["opts"].get("overwrite"):
+            return 0
+        n = 0
+        for f in frames or []:
+            st = j["fs"].get(str(f))
+            if st is not None and st["s"] == "todo":
+                st.update(s="done", v=True, by=None, comp=comp_id, t=now(), away=True, size=None)
+                n += 1
+        if n:
+            self.dirty = True
+            name = (self.computers.get(comp_id) or {}).get("name") or "Another computer"
+            self.event("%s already has %d frame%s of this render: not rendered again" % (name, n, "" if n == 1 else "s"))
+            self.check_finished()
+        return n
+
+    def op_have(self, req, ip):
+        with self.lock:
+            j = self.job
+            if not j or j["id"] != req.get("job") or j["state"] != "running":
+                return {"ok": False}
+            return {"ok": True, "n": self.mark_have(req.get("computer"), req.get("frames"))}
+
+    def op_probe(self, req, ip):
+        """Put a small file into the output folder. A computer that sees it appear shares the folder with the host
+        directly; one that doesn't has its own copy."""
+        with self.lock:
+            j = self.job
+            if not j or j["id"] != req.get("job"):
+                return {"error": "no such render"}
+            d = j["outdir"]
+        name = ".multigpu-probe-%s" % uuid.uuid4().hex[:8]
+        try:
+            with open(os.path.join(d, name), "w") as f:
+                f.write("x")
+        except OSError as e:
+            return {"error": "the host can't write to its output folder (%s)" % (e.strerror or e)}
+        with self.lock:
+            self.probes.append((now(), os.path.join(d, name)))
+        return {"ok": True, "name": name}
+
     def op_ping(self, req, ip):
         with self.lock:
             name = next((c.get("name") for c in self.computers.values() if c.get("host")), None)
@@ -1406,9 +1496,14 @@ class Coordinator(object):
         j = self.job
         if not j:
             return None
-        return {k: j.get(k) for k in ("id", "state", "blend", "scene", "sync", "sync_pending", "opts", "output",
-                                       "outdir", "host", "host_name", "frames_n", "unsynced", "first", "origin",
-                                       "term", "moved")}
+        out = {k: j.get(k) for k in ("id", "state", "blend", "scene", "sync", "sync_pending", "opts", "output",
+                                      "outdir", "host", "host_name", "frames_n", "unsynced", "first", "origin",
+                                      "term", "moved", "pattern")}
+        if j.get("pattern"):
+            if j.get("_ranges") is None:
+                j["_ranges"] = to_ranges(j["frames"])
+            out["ranges"] = j["_ranges"]
+        return out
 
     def want(self, cid):
         j = self.job
@@ -1596,7 +1691,8 @@ class Coordinator(object):
                         self.event("%s was stuck on frame %d, which another card has now rendered; restarting it"
                                    % (self.label(h), f))
                     h.update(frame=None, frame_t=None, backup=False)
-                st.update(s="done", by=card["id"], comp=card.get("computer"), t=t, v=False, card=None, backup=None,
+                gone = self.away(card.get("computer"))
+                st.update(s="done", by=card["id"], comp=card.get("computer"), t=t, v=gone, away=gone, card=None, backup=None,
                           size=rep.get("size"))
             elif st.get("by") != card["id"]:
                 st["size"] = None                 # written twice: either file is fine
@@ -1699,7 +1795,8 @@ class Coordinator(object):
                               "files": dict((file_key(f), f) for f in (spec.get("files") or [])[:FILES_MAX]
                                             if isinstance(f, str)),
                               "sets": dict((file_key(k), [f for f in v if isinstance(f, str)])
-                                           for k, v in (spec.get("sets") or {}).items() if isinstance(v, list))}
+                                           for k, v in (spec.get("sets") or {}).items() if isinstance(v, list)),
+                              "pattern": spec.get("pattern") if isinstance(spec.get("pattern"), dict) else None}
             for c in self.cards.values():
                 c.update(frame=None, frame_t=None, phase="off", stopped=False, streak=0, done=0, err=None,
                          warn=None, at=None, last_rid=None, last_fail=None, last_err=None, backup=False,
@@ -1710,6 +1807,9 @@ class Coordinator(object):
             self.nas_down = False
             self.pre = None
             self.event("Render started: %d frames%s" % (len(frames), ", %d already done" % existing if existing else ""))
+            for comp_id, have in (spec.get("have") or {}).items():     # frames other computers hold in their own copy
+                if isinstance(have, list):
+                    self.mark_have(comp_id, from_ranges(have))
             self.check_finished()
             res = {"ok": True, "job": job["id"], "existing": existing, "status": self.status()}
         if job["state"] == "running":
@@ -1869,6 +1969,7 @@ class Coordinator(object):
             pre = comp.get("pre") if self.pre and (comp.get("pre") or {}).get("id") == self.pre.get("id") else None
             comps.append({"id": comp["id"], "name": comp.get("name"), "os": comp.get("os"), "online": online,
                           "host": comp.get("host"), "blender": comp.get("blender"), "blocked": comp.get("blocked"),
+                          "away": self.away(comp["id"]),
                           "resolve_error": r.get("error") if j and r.get("job") == j["id"] and not r.get("ok") else None,
                           "resolving": bool(j and r.get("job") == j["id"] and r.get("busy")), "cards": cards,
                           "pre": pre, "ip": comp.get("ip")})
@@ -1884,6 +1985,7 @@ class Coordinator(object):
                     err = err or st.get("err")
                 elif st["s"] == "done" and not st.get("v"):
                     unverified += 1
+            arriving = sum(1 for f in j["frames"] if self.fs(f).get("away"))
             rate = 0.0
             for c in self.cards.values():
                 if c.get("avg") and c.get("phase") in ("rendering", "ready", "idle", "loading") \
@@ -1893,7 +1995,7 @@ class Coordinator(object):
             running = j["state"] == "running"
             out["job"] = {"id": j["id"], "state": j["state"], "total": len(j["frames"]), "done": n["done"],
                           "busy": n["busy"], "todo": n["todo"], "failed": failed[:40], "nfailed": n["failed"],
-                          "fail_err": err, "unverified": unverified, "existing": j.get("existing", 0),
+                          "fail_err": err, "unverified": unverified, "existing": j.get("existing", 0), "arriving": arriving,
                           "eta": left / rate if rate > 0 and left else None, "started": j["started"],
                           "ended": j.get("ended"), "synced_at": j.get("synced_at"), "sync": j["sync"],
                           "sync_pending": j.get("sync_pending"), "outdir": j["outdir"],
@@ -1933,12 +2035,19 @@ class Coordinator(object):
     def maintain_once(self):
         t = now()
         check, lockjob, cleanup, orphans, watchjob = [], None, None, [], None
+        arriving, old_probes = [], []
         with self.lock:
             j = self.job
             running = bool(j and j["state"] == "running")
+            old_probes = [q for q in self.probes if t - q[0] > 30]
+            self.probes = [q for q in self.probes if t - q[0] <= 30]
+            if j and t - self.arrive_t > 10:           # frames rendered into another computer's own copy of the
+                self.arrive_t = t                       # folder: have they reached this one yet?
+                arriving = [(f, q) for f, q in zip(j["frames"], j["paths"]) if self.fs(f).get("away")][:2000]
             if running:
                 for c in self.cards.values():
-                    if c.get("frame") is not None and t - c.get("seen", 0) > LEASE:
+                    if c.get("frame") is not None and \
+                            t - c.get("seen", 0) > (LEASE_AWAY if self.away(c.get("computer")) else LEASE):
                         f = c["frame"]
                         self.release(c)
                         c["phase"] = "lost"
@@ -1970,6 +2079,22 @@ class Coordinator(object):
                     orphans = [p for f, p in zip(j["frames"], j["paths"]) if self.fs(f)["s"] == "todo"]
             if self.cleanup:
                 cleanup, self.cleanup = self.cleanup, []
+        for _t, q in old_probes:
+            try:
+                os.remove(q)
+            except OSError:
+                pass
+        if arriving:
+            sizes = scan_sizes([q for _f, q in arriving])
+            here = [f for f, q in arriving if sizes.get(_norm(q), 0) > 0]
+            if here:
+                with self.lock:
+                    if self.job is j:
+                        for f in here:
+                            self.fs(f)["away"] = False
+                        self.dirty = True
+                        if j["state"] == "finished" and not any(self.fs(f).get("away") for f in j["frames"]):
+                            self.event("Every frame has arrived in %s" % j["outdir"])
         if running:
             self.awake.on()
         else:
@@ -2077,6 +2202,12 @@ class Coordinator(object):
             except OSError:
                 pass
         for d in item["outdirs"]:
+            try:
+                for n in os.listdir(d):
+                    if n.startswith(".multigpu-probe-"):
+                        os.remove(os.path.join(d, n))
+            except OSError:
+                pass
             part = os.path.join(d, ".multigpu-partial")
             try:
                 for sub in os.listdir(part):
@@ -2558,6 +2689,7 @@ def remap():
     return n
 
 
+AWAY = bool(cfg.get("away"))    # this computer renders into its own copy of the folder, which a sync program carries
 LIBMAPS = []    # [the host's folder, this computer's folder] of copied files: files next to them are found too
 
 
@@ -2906,7 +3038,11 @@ def prepare(f):
     final = os.path.normpath(rd.frame_path(frame=f))
     d = os.path.dirname(final)
     os.makedirs(d, exist_ok=True)
-    tmp = os.path.join(d, ".multigpu-partial", TAG)
+    if AWAY:                                        # nothing half-done in a folder a sync program is watching
+        tmp = os.path.join(STORE, "..", "partial", cfg["job"], TAG)
+        tmp = os.path.normpath(tmp)
+    else:
+        tmp = os.path.join(d, ".multigpu-partial", TAG)
     os.makedirs(tmp, exist_ok=True)
     ME["tmps"].add(tmp)
     clear_tmp(tmp)
@@ -2914,7 +3050,7 @@ def prepare(f):
     ext = rd.file_extension
     if rd.use_file_extension and ext and base.lower().endswith(ext.lower()):
         base = base[:-len(ext)]
-    if OPTS.get("placeholders", True) and not os.path.exists(final):
+    if OPTS.get("placeholders", True) and not AWAY and not os.path.exists(final):
         try:
             open(final, "xb").close()
         except OSError:
@@ -2936,10 +3072,14 @@ def move_into_place(src, dst):
         return
     except OSError:
         pass
-    shutil.copyfile(src, dst + ".multigpu-copy")    # last resort: copy, check, then swap in
-    if os.path.getsize(dst + ".multigpu-copy") != os.path.getsize(src):
+    # last resort (or another drive): copy, check, then swap in. In a synced folder under a name sync programs
+    # leave alone, so a half-written copy never travels.
+    part = os.path.join(os.path.dirname(dst), ".syncthing.%s.tmp" % os.path.basename(dst)) if AWAY \
+        else dst + ".multigpu-copy"
+    shutil.copyfile(src, part)
+    if os.path.getsize(part) != os.path.getsize(src):
         raise OSError("copying %s didn't finish" % os.path.basename(dst))
-    os.replace(dst + ".multigpu-copy", dst)
+    os.replace(part, dst)
     os.remove(src)
 
 
@@ -2975,9 +3115,27 @@ def out_reachable():
         return True
 
 
+def still_mine(f):
+    """With its own copy of the folder, a card asks before saving: if the host gave the frame to another card
+    meanwhile (the connection was down for long), saving it too would leave two different files for one frame."""
+    t0 = time.time()
+    while time.time() - t0 < 900 and not ME["exiting"]:
+        try:
+            r = call("beat", frame=f)
+            return not (r.get("drop") or r.get("exit"))
+        except OSError:
+            put(state="waiting for host")
+            time.sleep(5)
+    return False
+
+
 def report_for(f, t0, final=None, tmp=None, error=None):
     ME["n"] += 1
     rid = "%d-%d" % (os.getpid(), ME["n"])
+    if error is None and AWAY and not still_mine(f):
+        log("frame %d went to another card while the host couldn't be reached: not saved here" % f)
+        clear_tmp(tmp)
+        return None
     if error is None:
         try:
             total, own = collect(final, tmp)
@@ -3026,6 +3184,16 @@ def check_output():
         return None
     rd.filepath = OUT
     d = os.path.dirname(os.path.normpath(rd.frame_path(frame=first)))
+    if AWAY:                                        # this computer's own copy of the folder: only writing matters
+        try:
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, ".syncthing.multigpu-write-test-%s.tmp" % TAG)
+            with open(p, "w") as f:
+                f.write("x")
+            os.remove(p)
+        except OSError as e:
+            return "it can't write to %s: %s" % (d, e.strerror or e)
+        return None
     marker = os.path.join(d, ".multigpu-lock.json")
     t0 = time.time()
     while True:
@@ -3485,6 +3653,13 @@ def _origin_job():
     return job if job and job.get("state") == "running" and _origin_here(job) else None
 
 
+def _away_now():
+    """This computer renders into its own copy of the folder, not the host's: it must never take over as host
+    (a short break in the connection would start a second render of everything)."""
+    job = (_A.get("reply") or {}).get("job") or {}
+    return bool((_A["resolve"].get(job.get("id")) or {}).get("away"))
+
+
 def _blend_here(job):
     """This computer's path to the .blend being rendered, if it knows it."""
     if _origin_here(job):
@@ -3712,14 +3887,15 @@ def _snapshot(prefs, owner=True):
     res = None
     a = _addresses()
     base.update(port=prefs.port, addrs=[x for x in (a["lan"], a.get("tailscale")) if x],
-                failover=bool(prefs.mode == "JOIN" and prefs.joined and prefs.auto_takeover))
+                failover=bool(prefs.mode == "JOIN" and prefs.joined and prefs.auto_takeover and not _away_now()))
     if job:
         if _origin_here(job):
             res = {"job": job["id"], "sync": job["sync"], "ok": True}
         else:
             r = _A["resolve"].get(job["id"]) or {}
             res = {"job": job["id"], "sync": r.get("sync"), "ok": bool(r.get("ok")), "busy": bool(r.get("busy")),
-                   "error": r.get("error"), "host_prefix": r.get("hp"), "local_prefix": r.get("lp")}
+                   "error": r.get("error"), "host_prefix": r.get("hp"), "local_prefix": r.get("lp"),
+                   "away": bool(r.get("ok") and r.get("away"))}
     return {"op": "hello", "computer": dict(base, cards=cards, procs=procs, resolve=res)}
 
 
@@ -4011,15 +4187,91 @@ def _fo_tick(prefs, owner, addr):
     job = (_fresh_reply() or {}).get("job") or {}
     moved = dict(job["moved"], job=job["id"]) if job.get("state") == "moved" and job.get("moved") else None
     _A["fo_in"] = {"mode": prefs.mode, "joined": bool(prefs.joined), "owner": bool(owner), "addr": addr,
-                   "auto": bool(prefs.auto_takeover), "cid": _computer_id(), "name": _computer_name(), "moved": moved}
+                   "auto": bool(prefs.auto_takeover and not _away_now()), "cid": _computer_id(),
+                   "name": _computer_name(), "moved": moved}
     job_id = _A.get("running_job")
     if owner and addr and job_id and _A["addr_note"] != (job_id, addr):
         _write_json(_ADDR_FILE, {"job": job_id, "addr": addr, "t": time.time()})   # the cards read where the host is
         _A["addr_note"] = (job_id, addr)
 
 
+# ---- a computer with its own copy of the project folder ----------------------------------
+def _frames_here(pattern, ranges, maps):
+    """Of the render's frames, the ones this computer already has in its own copy of the output folder."""
+    if not pattern or not ranges:
+        return []
+    d = map_path(pattern["dir"], maps)
+    try:
+        have = set(e.name for e in os.scandir(d) if e.is_file() and e.stat().st_size > 0)
+    except OSError:
+        return []
+    return [f for f in from_ranges(ranges) if pattern_name(pattern, f) in have]
+
+
+def _own_folder(out):
+    """This computer's own copy of the output folder can be written to: None, or what's wrong."""
+    try:
+        os.makedirs(out, exist_ok=True)
+        p = os.path.join(out, ".syncthing.multigpu-write-test-%s.tmp" % uuid.uuid4().hex[:6])
+        with open(p, "w") as f:
+            f.write("x")
+        os.remove(p)
+    except OSError as e:
+        return "it can't write to its own copy of the output folder, %s (%s)" % (out, e.strerror or e)
+    return None
+
+
+def _frame_pattern(frames, paths):
+    """How the render names its frames, so another computer can tell which ones it already has."""
+    if not frames or min(frames) < 0:
+        return None
+    base, f = os.path.basename(paths[0]), frames[0]
+    for pad in range(12, len(str(f)) - 1, -1):
+        num = str(f).zfill(pad)
+        i = base.rfind(num)
+        if i >= 0 and not (i > 0 and base[i - 1].isdigit()):
+            pat = {"dir": os.path.dirname(paths[0]), "head": base[:i], "tail": base[i + len(num):], "pad": pad}
+            if all(os.path.basename(paths[k]) == pattern_name(pat, frames[k]) and os.path.dirname(paths[k]) == pat["dir"]
+                   for k in (0, len(frames) // 2, len(frames) - 1)):
+                return pat
+    return None
+
+
 # ---- finding the .blend on a joined computer -------------------------------------------
-def _resolve_thread(job, extra, key, prev):
+def _resolve_away(job, res, addr):
+    """Does this computer see the host's output folder itself, or does it have its own copy that a sync
+    program keeps in step? The host drops a small file into its folder: if it shows up here within seconds,
+    it is one folder. With its own copy, tell the host which frames are here already."""
+    if not res.get("hp") or not res.get("lp") or not addr:
+        return                                       # the very same path as the host's: one folder
+    maps = [[res["hp"], res["lp"]]]
+    out = map_path(job["outdir"], maps)
+    try:
+        r = rpc(addr, {"op": "probe", "job": job["id"]}, timeout=15.0)
+    except OSError:
+        return
+    if not r.get("ok"):
+        return
+    t0 = time.time()
+    while time.time() - t0 < 8:
+        if os.path.isfile(os.path.join(out, r["name"])):
+            return
+        time.sleep(0.5)
+    err = _own_folder(out)
+    if err:
+        res.update(ok=False, error=err)
+        return
+    res["away"] = True
+    if not (job.get("opts") or {}).get("overwrite"):
+        have = _frames_here(job.get("pattern"), job.get("ranges"), maps)
+        if have:
+            try:
+                rpc(addr, {"op": "have", "job": job["id"], "computer": _computer_id(), "frames": have}, timeout=30.0)
+            except OSError:
+                res.update(ok=False, error="couldn't tell the host which frames are already here")
+
+
+def _resolve_thread(job, extra, key, prev, addr=None):
     path, size = job["blend"]["path"], job["blend"].get("size")
     res = {"busy": False, "key": key, "sync": job["sync"], "ok": False}
     t0 = time.time()
@@ -4040,6 +4292,11 @@ def _resolve_thread(job, extra, key, prev):
             res["error"] = str(e)
             break
         time.sleep(2.0)
+    if res.get("ok"):
+        try:
+            _resolve_away(job, res, addr)
+        except Exception:
+            traceback.print_exc()
     res["t"] = time.time()
     _A["resolve"][job["id"]] = res
 
@@ -4058,7 +4315,8 @@ def _local_blend(prefs, job):
     prev = res if res.get("ok") or res.get("prev") is None else res.get("prev")
     prev = {k: prev.get(k) for k in ("path", "hp", "lp")} if prev else {}
     _A["resolve"][job["id"]] = {"busy": True, "key": key, "sync": job["sync"], "prev": prev}
-    threading.Thread(target=_resolve_thread, args=(job, prefs.shared_roots, key, prev), daemon=True).start()
+    addr = _A.get("addr") if _is_host_mode(prefs) else _join_addr(prefs)
+    threading.Thread(target=_resolve_thread, args=(job, prefs.shared_roots, key, prev, addr), daemon=True).start()
     return None
 
 
@@ -4093,7 +4351,14 @@ def _pre_thread(pre, extra, datafiles, addons):
         while not os.path.isfile(os.path.join(out, pre["probe"])) and time.time() - t0 < 6:
             time.sleep(1.0)                         # network shares can take a moment to show a new file
         if not os.path.isfile(os.path.join(out, pre["probe"])):
-            res["out_error"] = "its output folder (%s) isn't this computer's" % out
+            # not the host's folder itself: this computer's own copy, which a sync program keeps in step
+            err = _own_folder(out) if maps else "its output folder (%s) isn't this computer's" % out
+            if err:
+                res["out_error"] = err
+            else:
+                res["away"] = True
+                if not pre.get("overwrite"):
+                    res["have"] = to_ranges(_frames_here(pre.get("pattern"), pre.get("ranges"), maps))
         else:
             try:
                 p = os.path.join(out, ".multigpu-write-test-%s" % uuid.uuid4().hex[:6])
@@ -4186,7 +4451,8 @@ def _launch(prefs, g, cid, job, blend, maps, order, addr):
            "job": job["id"], "sync": job["sync"], "token": job["blend"].get("token"), "scene": job["scene"],
            "output": job["output"], "opts": job["opts"], "maps": maps, "ui": show, "rect": rect,
            "status": status, "log": logp, "version": VERSION, "first": job.get("first"),
-           "lock": os.path.join(_ROOT, "locks", "%s.lock" % cid), "addr_file": _ADDR_FILE}
+           "lock": os.path.join(_ROOT, "locks", "%s.lock" % cid), "addr_file": _ADDR_FILE,
+           "away": bool((_A["resolve"].get(job["id"]) or {}).get("away")) and not _origin_here(job)}
     prev = _A["procs"].get(cid) or {}
     if prev.get("job") == job["id"] and prev.get("tile"):
         cfg["tile"] = prev["tile"]                  # this card ran out of GPU memory earlier in this render
@@ -4712,9 +4978,11 @@ class MULTIGPU_Prefs(bpy.types.AddonPreferences):
                     "network), this computer carries the render on as the new host. Frames that are being "
                     "rendered are kept, and the old host joins back in as a helper when it returns")
     shared_roots: StringProperty(
-        name="NAS Folder on This Computer", default="",
-        description="Only needed if the host's .blend isn't found by itself: where the NAS share is on this "
-                    "computer, e.g. B:\\ or /mnt/nas. Separate several with ;")
+        name="Project Folder on This Computer", default="",
+        description="Where this computer has the project: the NAS share (e.g. B:\\ or /mnt/nas), or its own copy "
+                    "of it that a sync program such as Syncthing keeps in step (e.g. D:\\Sync). Only needed when "
+                    "the host's .blend isn't found by itself, or to work from this computer's own copy instead of "
+                    "a far-away original. Separate several with ;")
     show_windows: BoolProperty(
         name="Show Render", default=True,
         description="Open a Blender window for each card that shows its frame rendering live. They close by "
@@ -5013,6 +5281,7 @@ def _precheck(context, prefs):
         rpc(addr, {"op": "precheck", "pre": {
             "id": pid, "host": me, "blend": {"path": bpy.data.filepath, "size": os.path.getsize(bpy.data.filepath)},
             "files": files[:FILES_MAX], "outdir": outdir, "probe": probe, "needs": _needs(),
+            "pattern": _frame_pattern(frames, paths), "ranges": to_ranges(frames), "overwrite": bool(prefs.overwrite),
             "datafiles": _datafiles(), "copy": _sendable(files[:FILES_MAX]) if prefs.copy_missing else None}},
             timeout=4)
         t0 = time.time()
@@ -5032,6 +5301,8 @@ def _precheck(context, prefs):
         except OSError:
             pass
     mine = bpy.app.version_string
+    have = {}
+    _A["pre_have"] = (time.time(), have)       # frames other computers already hold in their own copy of the folder
     for c in others:
         name, r = c["name"], results.get(c["id"])
         if c.get("blender") and c["blender"] != mine:
@@ -5044,6 +5315,11 @@ def _precheck(context, prefs):
         else:
             if r.get("out_error"):
                 lines.append(('CANCEL', "%s can't take part: %s" % (name, r["out_error"][:150])))
+            if r.get("away"):
+                nh = len(from_ranges(r.get("have")))
+                have[c["id"]] = r.get("have") or []
+                lines.append(('IMPORT', "%s renders into its own copy of the folder%s"
+                              % (name, " and already has %d frame%s there" % (nh, "" if nh == 1 else "s") if nh else "")))
             if r.get("needs"):
                 lines.append(('CANCEL', "%s can't take part: the %s add-on isn't enabled there"
                               % (name, ", ".join(r["needs"]))))
@@ -5171,6 +5447,11 @@ class MULTIGPU_OT_render(bpy.types.Operator):
         if prefs.copy_missing:
             spec["files"] = sorted(_sendable(files))
             spec["sets"] = sets
+        spec["pattern"] = _frame_pattern(frames, paths)
+        ph = _A.get("pre_have")
+        if ph and time.time() - ph[0] < 300 and not prefs.overwrite:
+            spec["have"] = ph[1]
+        _A["pre_have"] = None
         try:
             r = rpc(addr, {"op": "start", "job": spec}, timeout=120)
         except OSError as e:
@@ -5696,6 +5977,11 @@ def draw_ui(layout, context, prefs_only=False):
             _alert(col, "%d frame%s failed: %s" % (job["nfailed"], "" if job["nfailed"] == 1 else "s",
                                                    ", ".join(str(f) for f in job["failed"][:8])))
         _draw_events(col, st)
+        if job.get("arriving"):
+            a = col.row()
+            a.scale_y = 0.8
+            a.label(text="%d frame%s rendered elsewhere, still on the way to this folder"
+                    % (job["arriving"], "" if job["arriving"] == 1 else "s"), icon='IMPORT')
         if job.get("synced_at"):
             s = col.row()
             s.scale_y = 0.8
@@ -5721,7 +6007,9 @@ def draw_ui(layout, context, prefs_only=False):
         res = col.box().row()
         took = _fmt((job.get("ended") or time.time()) - job["started"])
         if job["state"] == "finished" and not job.get("nfailed"):
-            res.label(text="Finished: %d frames in %s" % (job["total"], took), icon='CHECKMARK')
+            res.label(text="Finished: %d frames in %s%s" % (job["total"], took, ", %d still on the way here"
+                                                           % job["arriving"] if job.get("arriving") else ""),
+                      icon='CHECKMARK')
         elif job["state"] == "finished":
             res.alert = True
             res.label(text="Done, but %d frame%s failed: %s" % (job["nfailed"], "" if job["nfailed"] == 1 else "s",
@@ -5818,7 +6106,7 @@ def _draw_cards(col, st, prefs, running):
         if not cards and not comp.get("resolve_error"):
             continue
         head = wb.row()
-        name = comp["name"] + ("  (host)" if comp.get("host") else "")
+        name = comp["name"] + ("  (host)" if comp.get("host") else "") + ("  (own copy of the folder)" if comp.get("away") else "")
         if not comp["online"]:
             name += "  -  offline"
         head.label(text=name, icon='DESKTOP')
